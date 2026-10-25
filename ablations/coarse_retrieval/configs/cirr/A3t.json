@@ -1,0 +1,8 @@
+{
+  "id": "A3t",
+  "name": "entity_only_skl0.1",
+  "dataset": "cirr",
+  "train": {"estimator": "output/cirr_estimator_openclip/banzhaf_estimator.epoch10.pt", "skl": 0.1, "wti_levels": 1},
+  "eval": "mic_wti",
+  "note": "Same 2×16 recipe as A3/A3s; only SKL weight lowered from 0.3 to 0.1. Writes A3t_skl01_entity, does not overwrite A3 or A3s."
+}

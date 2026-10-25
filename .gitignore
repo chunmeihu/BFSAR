@@ -1,0 +1,10 @@
+.venv/
+output/
+weights/
+data/
+__pycache__/
+*.py[cod]
+*.pt
+*.pth
+*.npz
+*.log
