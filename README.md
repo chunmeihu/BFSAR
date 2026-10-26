@@ -3,7 +3,7 @@
 Source for the released CIRR and FashionIQ pipeline:
 
 1. Pretrain a frozen Banzhaf teacher on the token–region similarity matrix of positive pairs (Monte Carlo targets, MSE). The CLIP encoder stays frozen.
-2. Train a single-level entity WTI retriever. A student with the same architecture is distilled from the teacher with a bidirectional KL loss. CIRR uses `skl=0.1`. FashionIQ uses `skl=1.0`.
+2. Train a Fine-Grained Semantic Alignment module. A student with the same architecture is distilled from the teacher with a bidirectional KL loss. CIRR uses `skl=0.1`. FashionIQ uses `skl=1.0`.
 3. Dual-path coarse retrieval (`Path_ref` and `Path_vis`) with that retriever.
 4. Rerank the coarse top-K by fusing three scores: the coarse score, BLIP-2 QTR Composer, and Candidate Reranking.
 
