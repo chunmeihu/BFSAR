@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""CIRR multi-view reranking: coarse DPIC + CQM + CVS.
+
+Per-query z-score, then
+    S = 0.25 * S_CRS + 0.40 * S_CQM + 0.35 * S_CVS
+on the top-200 pool.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import logging
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from bfsar.cirr import cirr_paths
+from bfsar.mvr.export_topk import load_coarse_sim_npz
+from bfsar.mvr.cvs_infer import (
+    DEFAULT_STAGE1,
+    DEFAULT_STAGE2,
+    align_gallery_index_to_cirr,
+    metrics_stage2_pool,
+    run_blip_stage2_rerank,
+)
+from bfsar.rerank.paths import DEFAULT_CIRR_TOPK_VAL
+
+logger = logging.getLogger("hbi_cqm_cr_fusion")
+
+DEFAULT_TOPK = DEFAULT_CIRR_TOPK_VAL
+DEFAULT_COMPOSER = ROOT / "weights/cqm/cirr/cqm.pt"
+DEFAULT_COARSE_NPZ = ROOT / "output/cirr_vision_desc/hbi_triple_removed_best_sim.npz"
+DEFAULT_OUT = ROOT / "output/mvr/cirr"
+CR_BASELINE = 53.36
+
+
+def _recover_k_sorted(reranked_topk: np.ndarray, rerank_idx: np.ndarray) -> np.ndarray:
+    inv = np.argsort(rerank_idx, axis=1)
+    return np.take_along_axis(reranked_topk, inv, axis=1)
+
+
+def _as_str_arr(names) -> np.ndarray:
+    return np.asarray([str(x) for x in names], dtype=object)
+
+
+def zscore_rows(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    mu = x.mean(axis=1, keepdims=True)
+    sd = x.std(axis=1, keepdims=True)
+    sd = np.where(sd < 1e-6, 1.0, sd)
+    return (x - mu) / sd
+
+
+def minmax_rows(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    lo = x.min(axis=1, keepdims=True)
+    hi = x.max(axis=1, keepdims=True)
+    den = np.where((hi - lo) < 1e-6, 1.0, hi - lo)
+    return (x - lo) / den
+
+
+def pool_from_scores(
+    scores: np.ndarray,
+    k_sorted: np.ndarray,
+    target_names: List[str],
+    group_scores: Optional[np.ndarray],
+    group_members: List[List[str]],
+) -> Dict[str, float]:
+    rerank_idx = np.argsort(-scores, axis=1)
+    labels = (_as_str_arr(k_sorted.reshape(-1)).reshape(k_sorted.shape) == np.asarray(target_names).reshape(-1, 1))
+    if group_scores is None or not group_members:
+        dummy_g = np.asarray([[""] * 5] * len(target_names), dtype=object)
+        return metrics_stage2_pool(rerank_idx, labels, dummy_g, target_names)
+    g_idx = np.argsort(-group_scores, axis=1)
+    g_arr = np.array(group_members, dtype=object)
+    reranked_g = np.take_along_axis(g_arr, g_idx, axis=1)
+    return metrics_stage2_pool(rerank_idx, labels, reranked_g, target_names)
+
+
+def _free_cuda() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def compute_cqm(args) -> Dict[str, Any]:
+    from bfsar.mvr.cqm_rerank_cirr import run_cirr_blip2_qtr_rerank
+
+    logger.info("CQM ITC: %s", args.cqm_ckpt)
+    out = run_cirr_blip2_qtr_rerank(
+        Path(args.topk_pt),
+        split="val",
+        k_rerank=args.k_rerank,
+        ckpt_path=Path(args.cqm_ckpt),
+        local_files_only=True,
+        max_queries=args.max_queries,
+        num_workers=args.num_workers,
+        score_mode="itc",
+    )
+    return {
+        "pred_logits": np.asarray(out["pred_logits"], dtype=np.float32),
+        "target_names": list(out["target_names"]),
+        "reference_names": list(out["reference_names"]),
+        "group_members_no_ref": out["group_members_no_ref"],
+        "k_sorted": _recover_k_sorted(out["reranked_topk"], out["rerank_idx"]),
+        "pool_metrics": out.get("pool_metrics") or {},
+    }
+
+
+def compute_cr(args) -> Dict[str, Any]:
+    logger.info("CR NLVR Stage-2: %s", args.stage2_path)
+    out = run_blip_stage2_rerank(
+        Path(args.topk_pt),
+        Path(args.stage1_path),
+        Path(args.stage2_path),
+        k_rerank=args.k_rerank,
+        max_queries=args.max_queries,
+        num_workers=args.num_workers,
+    )
+    return {
+        "pred_logits": np.asarray(out["pred_logits"], dtype=np.float32),
+        "target_names": list(out["target_names"]),
+        "reference_names": list(out["reference_names"]),
+        "group_members_no_ref": out["group_members_no_ref"],
+        "k_sorted": _recover_k_sorted(out["reranked_topk"], out["rerank_idx"]),
+    }
+
+
+def compute_hbi(
+    coarse_npz: Path,
+    reference_names: List[str],
+    target_names: List[str],
+    k_sorted: np.ndarray,
+    group_members: List[List[str]],
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    sim, hbi_refs, hbi_tgts, index_names = load_coarse_sim_npz(str(coarse_npz))
+    sim, index_names = align_gallery_index_to_cirr(sim, index_names, split="val")
+    name_to_j = {str(n): i for i, n in enumerate(index_names)}
+    key_to_row = {cirr_paths.pair_key(r, t): i for i, (r, t) in enumerate(zip(hbi_refs, hbi_tgts))}
+    n, k = k_sorted.shape
+    scores = np.zeros((n, k), dtype=np.float32)
+    g_len = max(len(g) for g in group_members) if group_members else 5
+    g_scores = np.zeros((n, g_len), dtype=np.float32)
+    missing = 0
+    for i in range(n):
+        key = cirr_paths.pair_key(str(reference_names[i]), str(target_names[i]))
+        if key not in key_to_row:
+            scores[i] = np.linspace(1.0, 0.0, k, dtype=np.float32)
+            missing += 1
+            continue
+        row = sim[key_to_row[key]]
+        cols = [name_to_j[str(nm)] for nm in k_sorted[i]]
+        scores[i] = row[cols]
+        gcols = [name_to_j[str(nm)] for nm in group_members[i]]
+        g_scores[i, : len(gcols)] = row[gcols]
+    return scores, g_scores, missing
+
+
+def _save_npz(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        pred_logits=payload["pred_logits"],
+        target_names=np.asarray(payload["target_names"], dtype=object),
+        reference_names=np.asarray(payload["reference_names"], dtype=object),
+        k_sorted=np.asarray(payload["k_sorted"], dtype=object),
+        group_members=np.asarray(payload["group_members_no_ref"], dtype=object),
+    )
+
+
+def _load_npz(path: Path) -> Dict[str, Any]:
+    d = np.load(path, allow_pickle=True)
+    return {
+        "pred_logits": d["pred_logits"].astype(np.float32),
+        "target_names": [str(x) for x in d["target_names"].tolist()],
+        "reference_names": [str(x) for x in d["reference_names"].tolist()],
+        "k_sorted": d["k_sorted"],
+        "group_members_no_ref": d["group_members"].tolist(),
+    }
+
+
+def _assert_aligned(a: Dict[str, Any], b: Dict[str, Any], tag: str) -> None:
+    if a["reference_names"] != b["reference_names"] or a["target_names"] != b["target_names"]:
+        raise RuntimeError(f"Query order mismatch vs {tag}")
+    if not np.array_equal(a["k_sorted"].astype(str), b["k_sorted"].astype(str)):
+        raise RuntimeError(f"Top-K name order mismatch vs {tag}")
+
+
+def grid_fusion(
+    s_scrs: np.ndarray,
+    s_comp: np.ndarray,
+    s_cr: np.ndarray,
+    k_sorted: np.ndarray,
+    target_names: List[str],
+    group_members: List[List[str]],
+    g_scrs: Optional[np.ndarray],
+    g_comp: Optional[np.ndarray],
+    g_cr: Optional[np.ndarray],
+    norm: str,
+    step: float,
+) -> Dict[str, Any]:
+    norm_fn = zscore_rows if norm == "zscore" else minmax_rows
+    h = norm_fn(s_scrs)
+    c = norm_fn(s_comp)
+    r = norm_fn(s_cr)
+    gh = norm_fn(g_scrs) if g_scrs is not None else None
+    gc_ = norm_fn(g_comp) if g_comp is not None else None
+    gr = norm_fn(g_cr) if g_cr is not None else None
+
+    alphas = np.round(np.arange(0.0, 1.0 + 1e-9, step), 4)
+    rows = []
+    best = None
+    for a in alphas:
+        for b in alphas:
+            if a + b > 1.0 + 1e-9:
+                continue
+            g = float(np.round(1.0 - a - b, 4))
+            fused = a * h + b * c + g * r
+            g_fused = None
+            if gh is not None and gc_ is not None and gr is not None:
+                g_fused = a * gh + b * gc_ + g * gr
+            m = pool_from_scores(fused, k_sorted, target_names, g_fused, group_members)
+            rec = {
+                "lambda_1": float(a),
+                "lambda_2": float(b),
+                "lambda_3": g,
+                **{k: float(v) for k, v in m.items()},
+            }
+            rows.append(rec)
+            if best is None or rec["pool_recall_at1"] > best["pool_recall_at1"]:
+                best = rec
+    singles = {
+        "hbi": pool_from_scores(s_scrs, k_sorted, target_names, g_scrs, group_members),
+        "cqm": pool_from_scores(s_comp, k_sorted, target_names, g_comp, group_members),
+        "cr": pool_from_scores(s_cr, k_sorted, target_names, g_cr, group_members),
+    }
+    return {"norm": norm, "step": step, "singles": singles, "best": best, "grid": rows}
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--only", choices=["cqm", "cr", "fuse", "all"], default="all")
+    p.add_argument("--topk_pt", type=str, default=str(DEFAULT_TOPK))
+    p.add_argument("--k_rerank", type=int, default=200)
+    p.add_argument("--lambda_1", type=float, default=0.25)
+    p.add_argument("--lambda_2", type=float, default=0.40)
+    p.add_argument("--lambda_3", type=float, default=0.35)
+    p.add_argument("--cqm_ckpt", type=str, default=str(DEFAULT_COMPOSER))
+    p.add_argument("--coarse_npz", type=str, default=str(DEFAULT_COARSE_NPZ))
+    p.add_argument("--stage1_path", type=str, default=str(DEFAULT_STAGE1))
+    p.add_argument("--stage2_path", type=str, default=str(DEFAULT_STAGE2))
+    p.add_argument("--out_dir", type=str, default=str(DEFAULT_OUT))
+    p.add_argument("--max_queries", type=int, default=None)
+    p.add_argument("--num_workers", type=int, default=0)
+    return p.parse_args()
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    args = parse_args()
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cqm_npz = out_dir / "cqm_itc_scores.npz"
+    cr_npz = out_dir / "cr_nlvr_scores.npz"
+
+    if args.only in ("cqm", "all"):
+        payload = compute_cqm(args)
+        _save_npz(cqm_npz, payload)
+        logger.info("Saved %s  pool=%s", cqm_npz, payload.get("pool_metrics"))
+        _free_cuda()
+        if args.only == "cqm":
+            return
+
+    if args.only in ("cr", "all"):
+        payload = compute_cr(args)
+        _save_npz(cr_npz, payload)
+        logger.info("Saved %s", cr_npz)
+        _free_cuda()
+        if args.only == "cr":
+            return
+
+    if not cqm_npz.is_file() or not cr_npz.is_file():
+        raise FileNotFoundError(f"Need {cqm_npz} and {cr_npz} before fuse")
+
+    comp = _load_npz(cqm_npz)
+    cr = _load_npz(cr_npz)
+    _assert_aligned(comp, cr, "CR")
+
+    s_scrs, g_scrs, n_miss = compute_hbi(
+        Path(args.coarse_npz),
+        comp["reference_names"],
+        comp["target_names"],
+        comp["k_sorted"],
+        comp["group_members_no_ref"],
+    )
+    logger.info("BFSAR scores aligned; missing_sim_rows=%d / %d", n_miss, len(comp["target_names"]))
+
+    report: Dict[str, Any] = {
+        "k_rerank": args.k_rerank,
+        "n_queries": len(comp["target_names"]),
+        "hbi_missing_rows": n_miss,
+        "cr_baseline_paper": CR_BASELINE,
+        "cqm_ckpt": args.cqm_ckpt,
+        "stage2_path": args.stage2_path,
+        "topk_pt": args.topk_pt,
+    }
+    a, b, g = float(args.lambda_1), float(args.lambda_2), float(args.lambda_3)
+    h = zscore_rows(s_scrs)
+    c = zscore_rows(comp["pred_logits"])
+    r = zscore_rows(cr["pred_logits"])
+    fused_scores = a * h + b * c + g * r
+    metrics = pool_from_scores(
+        fused_scores,
+        comp["k_sorted"],
+        comp["target_names"],
+        None,
+        comp["group_members_no_ref"],
+    )
+    report["lambda_1"] = a
+    report["lambda_2"] = b
+    report["lambda_3"] = g
+    report["fused"] = {k: float(v) for k, v in metrics.items()}
+    out_json = out_dir / "fusion_metrics.json"
+    out_json.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info(
+        "Fused λ=(%.2f, %.2f, %.2f) %s",
+        a, b, g, {k: round(float(v), 2) for k, v in metrics.items()},
+    )
+
+
+if __name__ == "__main__":
+    main()

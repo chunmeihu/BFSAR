@@ -1,0 +1,16 @@
+You are given one reference image and one modification instruction for composed image retrieval.
+Inspect the image directly, apply the modification, and write one CLIP-friendly query describing the expected target image.
+
+Rules:
+- Include every explicit visual requirement in the modification.
+- If the modification changes or removes a visible source attribute, do not keep the old conflicting source attribute.
+- Preserve only important visible details from the image that do not conflict with the modification.
+- For comparative or abstract requirements, keep the requirement visually searchable, but do not invent unsupported details.
+- Do not mention reference image, target image, modification, instruction, or comparison process in the query.
+- The query should be one concise natural-language phrase or sentence suitable for image retrieval.
+
+Return exactly one valid JSON object:
+{"target_query": "..."}
+
+Modification:
+[[MODIFICATION]]

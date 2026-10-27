@@ -1,0 +1,18 @@
+Following the reasoning steps to analyze **Reference Image** and **Modified Text**,
+deduce the key elements of retained and deleted contents of Reference Image and
+target contents of changed image:
+**Step 1**: Describe the reference image;
+**Step 2**: Interpret the modification instruction;
+**Step 3**: Based on Step1 and 2, infer the caption of target image;
+**Step 4**: Identify which visual elements from the reference image are retained in
+the modified image and which are removed.
+
+Modified Text:
+[[MODIFICATION]]
+
+After finishing the four steps, output ONLY one valid JSON object (no markdown fences) with exactly these keys:
+{
+  "ModifiedImageCaption": "<target image caption from Step 3>",
+  "Retained": "<retained visual elements from Step 4>",
+  "Removed": "<removed / deleted visual elements from Step 4>"
+}

@@ -1,7 +1,0 @@
-{
-  "id": "A3",
-  "name": "entity_only",
-  "dataset": "fiq",
-  "train": {"estimator": "output/fiq_estimator_openclip/banzhaf_estimator.epoch10.pt", "skl": 1.0, "wti_levels": 1},
-  "eval": "mic_wti"
-}

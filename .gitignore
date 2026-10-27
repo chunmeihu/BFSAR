@@ -1,10 +1,15 @@
 .venv/
 output/
 weights/
-data/
 __pycache__/
 *.py[cod]
 *.pt
 *.pth
 *.npz
 *.log
+
+data/cirr/img_raw/
+data/cirr/cirr_dataset/
+data/fashioniq/images/
+data/fashioniq/captions/
+data/fashioniq/image_splits/
