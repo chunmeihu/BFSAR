@@ -1,9 +1,8 @@
-# CQM (BLIP-2 QTR)
+# Composed query matching
 
-Sibling of `BFSAR/rerank/cr`. Implementation stays under dataset packages:
+Training and inference live in `bfsar/mvr/`.
 
-- Train CIRR: `python -m bfsar.mvr.train_cqm_cirr`
-- Train FIQ: `python -m bfsar.mvr.train_cqm_fiq`
-- Scripts: `scripts/run_train_*_blip2_qtr_stage_a.sh`
+- CIRR: `bash scripts/train_cqm_cirr.sh`
+- FashionIQ: `bash scripts/train_cqm_fiq.sh`
 
-Default checkpoints: see `bfsar.rerank.paths.COMPOSER_*_DEFAULT`.
+Checkpoints: `weights/cqm/cirr/cqm.pt` and `weights/cqm/fashioniq/cqm.pt`.
