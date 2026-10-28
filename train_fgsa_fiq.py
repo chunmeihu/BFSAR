@@ -28,7 +28,6 @@ from bfsar.fiq.fiq_dataloader_builders import (
     build_fiq_gallery_dataloader,
 )
 from bfsar.fiq.eval_fgsa import evaluate_fiq_val
-from bfsar.fiq import fiq_paths
 from bfsar.utils.comm import is_main_process, synchronize
 from bfsar.utils.logger import setup_logger
 from bfsar.utils.metric_logger import MetricLogger
@@ -39,9 +38,9 @@ global logger
 def get_args():
     parser = argparse.ArgumentParser(
         description="Fashion-IQ BFSAR retrieval (ModifiedImageCaption -> category gallery)")
-    parser.add_argument("--do_train", type=int, default=0)
+    parser.add_argument("--do_train", type=int, default=1)
     parser.add_argument("--do_eval", type=int, default=0)
-    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default="output/fgsa/fashioniq")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -49,11 +48,11 @@ def get_args():
     parser.add_argument("--warmup_proportion", type=float, default=0.1)
     parser.add_argument("--weight_decay", type=float, default=0.2)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=16,
+    parser.add_argument("--batch_size", type=int, default=64,
                         help="Per-GPU batch; contrastive batch = batch_size * num_gpus")
     parser.add_argument("--batch_size_val", type=int, default=16)
-    parser.add_argument("--max_words", type=int, default=77)
-    parser.add_argument("--max_frames", type=int, default=6, help="Number of image crops; FIQ uses 6")
+    parser.add_argument("--max_words", type=int, default=32)
+    parser.add_argument("--max_frames", type=int, default=12, help="Number of image crops")
     parser.add_argument("--image_resolution", type=int, default=224)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--local_rank", type=int, default=0)
@@ -68,11 +67,15 @@ def get_args():
     parser.add_argument("--n_display", type=int, default=50)
     parser.add_argument("--eval_every", type=int, default=500, help="Run FIQ val every N steps (0=epoch only)")
     parser.add_argument("--base_encoder", type=str, default="ViT-L/14")
-    parser.add_argument("--clip_checkpoint", type=str, default=fiq_paths.CLIP_VITL14_CHECKPOINT)
+    parser.add_argument(
+        "--clip_checkpoint",
+        type=str,
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights", "openclip", "ViT-L-14-laion2B-s32B-b82K.pt"),
+    )
     parser.add_argument("--agg_module", type=str, default="None", choices=["None", "seqLSTM", "seqTransf"])
     parser.add_argument("--interaction", type=str, default="fgsa")
     parser.add_argument("--num_hidden_layers", type=int, default=4)
-    parser.add_argument("--estimator", type=str, default="None", help="Stage-1 banzhafteacher weights")
+    parser.add_argument("--estimator", type=str, default="weights/bm/fashioniq/banzhaf_module.pt", help="Stage-1 banzhafteacher weights")
     parser.add_argument("--init_model", type=str, default=None, help="Optional FGSAModel checkpoint (not CIRR SOTA)")
     parser.add_argument("--start_epoch", type=int, default=1,
                         help="1-based epoch to start/resume from; loads epoch{start_epoch-1} weights when >1")
@@ -84,10 +87,10 @@ def get_args():
                         help="Best val mean R@200 from prior stage (R@100 tie-break)")
     parser.add_argument("--kl", type=float, default=2.0)
     parser.add_argument("--lambda_b", type=float, default=1.0)
-    parser.add_argument("--v_rate0", type=float, default=0.5,
-                        help="Visual CTM stage-0 keep rate; 0.5 on 6 crops → ~3 clusters")
-    parser.add_argument("--v_rate1", type=float, default=1.0,
-                        help="Visual CTM stage-1 keep rate; 1.0 on 6 crops keeps all players")
+    parser.add_argument("--v_rate0", type=float, default=0.25,
+                        help="Visual keep rate at the first level")
+    parser.add_argument("--v_rate1", type=float, default=0.5,
+                        help="Visual keep rate at the second level")
     parser.add_argument("--t_rate0", type=float, default=0.25)
     parser.add_argument("--t_rate1", type=float, default=0.5)
     parser.add_argument("--rate", type=float, nargs=3, default=[1.0, 1.0, 1.0])
@@ -216,7 +219,12 @@ def save_model(epoch, args, model, tag=""):
     name = f"pytorch_model.bin.{tag + '.' if tag else ''}{epoch}"
     path = join(args.output_dir, name)
     torch.save(inner.state_dict(), path)
-    logger.info("Saved model to %s", path)
+    if tag == "best":
+        from bfsar.checkpoint_io import publish_checkpoint
+        published = publish_checkpoint(path, join(os.path.dirname(os.path.abspath(__file__)), "weights", "fgsa", "fashioniq", "pytorch_model.bin"))
+        logger.info("Saved model to %s and %s", path, published)
+    else:
+        logger.info("Saved model to %s", path)
     return path
 
 
@@ -396,7 +404,7 @@ def main():
     if "cirr" in os.path.abspath(args.output_dir).lower():
         raise ValueError(f"FIQ run must not write under a cirr output path: {args.output_dir}")
     os.makedirs(args.output_dir, exist_ok=True)
-    logger = setup_logger("fiq_hbi", args.output_dir, args.local_rank)
+    logger = setup_logger("fgsa_fiq", args.output_dir, args.local_rank)
     args = setup_device(args)
 
     for k in sorted(vars(args)):

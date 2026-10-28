@@ -34,7 +34,7 @@ from bfsar.models.tokenization_clip import SimpleTokenizer as ClipTokenizer
 
 logger = logging.getLogger("triple_vision_eval")
 
-DEFAULT_CKPT = str(ROOT / "output" / "cirr_retrieval" / "pytorch_model.bin.best.10")
+DEFAULT_CKPT = str(ROOT / "weights" / "fgsa" / "cirr" / "pytorch_model.bin")
 DEFAULT_DESCS = str(ROOT / "data" / "cirr" / "vision_desc" / "val_dual_targets.json")
 DEFAULT_OUT = str(ROOT / "output" / "cirr_vision_desc" / "metrics_triple_vision.json")
 
@@ -51,14 +51,17 @@ class CIRRTripleVisionDataset(Dataset):
         tokenizer,
         max_words: int = 77,
         max_samples: Optional[int] = None,
+        split: str = "val",
     ):
         self.tokenizer = tokenizer
         self.max_words = max_words
-        with open(cirr_paths.caption_json("val"), "r") as f:
+        file_split = "test1" if split in ("test", "test1") else "val"
+        self.split = file_split
+        with open(cirr_paths.caption_json(file_split), "r") as f:
             triplets = json.load(f)
         with open(dual_json, "r", encoding="utf-8") as f:
             dual = json.load(f)
-        with open(cirr_paths.llm_json("val"), "r") as f:
+        with open(cirr_paths.llm_json(file_split), "r") as f:
             llm = json.load(f)
 
         self.queries = []
@@ -66,19 +69,36 @@ class CIRRTripleVisionDataset(Dataset):
             if max_samples is not None and idx >= max_samples:
                 break
             ref = t["reference"]
-            tgt = t["target_hard"]
-            key = cirr_paths.pair_key(ref, tgt)
+            if t.get("target_hard"):
+                tgt = t["target_hard"]
+                key = cirr_paths.pair_key(ref, tgt)
+            else:
+                tgt = ""
+                key = cirr_paths.test1_llm_key(t.get("pairid"), ref)
             item = dual.get(key) or {}
             vision = str(item.get("vision_side") or "").strip()
             modified = str(llm.get(key, {}).get("ModifiedImageCaption") or "").strip()
             relative = str(t.get("caption") or "").strip()
-            if not modified or not relative:
+            if file_split == "test1":
+                # Test1 keeps every official pair. An empty generated caption is
+                # filled from the human caption, and an empty human caption from
+                # the generated one. Val still drops a pair when either side is empty.
+                if modified and not relative:
+                    relative = modified
+                elif relative and not modified:
+                    modified = relative
+                if not relative:
+                    continue
+                if not modified:
+                    modified = relative
+            elif not modified or not relative:
                 continue
             if not vision:
                 vision = relative  # fallback; shouldn't happen after full gen
             self.queries.append(
                 {
                     "idx": idx,
+                    "pairid": int(t["pairid"]) if t.get("pairid") is not None else -1,
                     "vision": vision,
                     "modified": modified,
                     "relative": relative,
@@ -370,10 +390,6 @@ def main():
         "weight_step": step,
         "metrics": results,
         "weight_grid_top20": grid[:20],
-        "baselines_note": {
-            "hbi_modified_only_best10": 36.04,
-            "hbi_mod_plus_relative_equal": 39.54,
-        },
     }
     Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output_json, "w", encoding="utf-8") as f:

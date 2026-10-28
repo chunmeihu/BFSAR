@@ -21,7 +21,6 @@ from bfsar.cirr.cirr_dataloader_builders import (
     build_cirr_gallery_dataloader,
 )
 from bfsar.cirr.eval_fgsa import evaluate_cirr_val
-from bfsar.cirr import cirr_paths
 from bfsar.utils.comm import is_main_process, synchronize
 from bfsar.utils.logger import setup_logger
 from bfsar.utils.metric_logger import MetricLogger
@@ -32,9 +31,9 @@ global logger
 def get_args():
     parser = argparse.ArgumentParser(
         description="CIRR BFSAR retrieval (text ModifiedImageCaption -> target image gallery)")
-    parser.add_argument("--do_train", type=int, default=0)
+    parser.add_argument("--do_train", type=int, default=1)
     parser.add_argument("--do_eval", type=int, default=0)
-    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default="output/fgsa/cirr")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -48,7 +47,7 @@ def get_args():
     )
     parser.add_argument("--warmup_proportion", type=float, default=0.1)
     parser.add_argument("--weight_decay", type=float, default=0.2)
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=16,
                         help="Per-GPU batch; contrastive batch = batch_size * num_gpus")
     parser.add_argument("--batch_size_val", type=int, default=16)
@@ -68,18 +67,22 @@ def get_args():
     parser.add_argument("--n_display", type=int, default=50)
     parser.add_argument("--eval_every", type=int, default=500, help="Run CIRR val every N steps (0=epoch only)")
     parser.add_argument("--base_encoder", type=str, default="ViT-L/14")
-    parser.add_argument("--clip_checkpoint", type=str, default=cirr_paths.CLIP_VITL14_CHECKPOINT)
+    parser.add_argument(
+        "--clip_checkpoint",
+        type=str,
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights", "openclip", "ViT-L-14-laion2B-s32B-b82K.pt"),
+    )
     parser.add_argument("--agg_module", type=str, default="None", choices=["None", "seqLSTM", "seqTransf"])
     parser.add_argument("--interaction", type=str, default="fgsa")
     parser.add_argument("--num_hidden_layers", type=int, default=4)
-    parser.add_argument("--estimator", type=str, default="None", help="Stage-1 banzhafteacher weights")
+    parser.add_argument("--estimator", type=str, default="weights/bm/cirr/banzhaf_module.pt", help="Stage-1 banzhafteacher weights")
     parser.add_argument("--init_model", type=str, default=None, help="Optional FGSAModel checkpoint (not MSRVTT)")
     parser.add_argument("--start_epoch", type=int, default=1,
                         help="1-based epoch to start/resume from; loads epoch{start_epoch-1} weights when >1")
     parser.add_argument("--resume_best_r1", type=float, default=0.0,
                         help="Best val R@1 from prior stage (keeps best checkpoint tracking on resume)")
     parser.add_argument("--kl", type=float, default=2.0)
-    parser.add_argument("--lambda_b", type=float, default=1.0)
+    parser.add_argument("--lambda_b", type=float, default=0.1)
     parser.add_argument("--v_rate0", type=float, default=0.25)
     parser.add_argument("--v_rate1", type=float, default=0.5)
     parser.add_argument("--t_rate0", type=float, default=0.25)
@@ -227,7 +230,12 @@ def save_model(epoch, args, model, tag=""):
     name = f"pytorch_model.bin.{tag + '.' if tag else ''}{epoch}"
     path = join(args.output_dir, name)
     torch.save(inner.state_dict(), path)
-    logger.info("Saved model to %s", path)
+    if tag == "best":
+        from bfsar.checkpoint_io import publish_checkpoint
+        published = publish_checkpoint(path, join(os.path.dirname(os.path.abspath(__file__)), "weights", "fgsa", "cirr", "pytorch_model.bin"))
+        logger.info("Saved model to %s and %s", path, published)
+    else:
+        logger.info("Saved model to %s", path)
     return path
 
 
@@ -338,7 +346,7 @@ def main():
     global logger
     args = get_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    logger = setup_logger("cirr_hbi", args.output_dir, args.local_rank)
+    logger = setup_logger("fgsa_cirr", args.output_dir, args.local_rank)
     args = setup_device(args)
 
     for k in sorted(vars(args)):

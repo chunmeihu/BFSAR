@@ -30,7 +30,7 @@ from bfsar.fiq.fiq_dataloader_builders import build_fiq_gallery_dataloader
 from bfsar.cirr.eval_fgsa import encode_gallery, _similarity_matrix
 from bfsar.cirr.metrics import rank_by_similarity
 from bfsar.cirr.modeling_fgsa import FGSAModel
-from bfsar.cirr.vision_desc.eval_hbi_pos_neg import encode_neg_phrase_sim
+from bfsar.cirr.vision_desc.neg_phrase import encode_neg_phrase_sim
 from bfsar.dpic.encode_cirr import encode_three, weighted_fuse
 from bfsar.dpic.encode_cirr_removed import (
     fuse_triple_minus_removed,
@@ -49,7 +49,7 @@ logger = logging.getLogger("fiq_triple_vision_removed")
 
 BEST_W = (0.3, 0.3, 0.4)
 BEST_MU = 0.1
-DEFAULT_CKPT = str(ROOT / "output" / "fiq_retrieval" / "pytorch_model.bin.best.5")
+DEFAULT_CKPT = str(ROOT / "weights" / "fgsa" / "fashioniq" / "pytorch_model.bin")
 DEFAULT_DESCS = str(ROOT / "data" / "fashioniq" / "vision_desc" / "val_dual_targets.json")
 DEFAULT_OUT = str(ROOT / "output" / "fiq_vision_desc" / "metrics_triple_vision_removed.json")
 

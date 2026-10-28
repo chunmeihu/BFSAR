@@ -33,7 +33,7 @@ if str(ROOT) not in sys.path:
 
 from bfsar.cirr.eval_fgsa import encode_gallery, _similarity_matrix
 from bfsar.cirr.modeling_fgsa import FGSAModel
-from bfsar.cirr.vision_desc.eval_hbi_pos_neg import encode_neg_phrase_sim
+from bfsar.cirr.vision_desc.neg_phrase import encode_neg_phrase_sim
 from bfsar.dpic.encode_cirr import encode_three, weighted_fuse
 from bfsar.dpic.encode_cirr_removed import (
     fuse_triple_minus_removed,
@@ -51,7 +51,7 @@ from bfsar.models.tokenization_clip import SimpleTokenizer as ClipTokenizer
 
 logger = logging.getLogger("fiq_refsim_fusion")
 
-DEFAULT_CKPT = str(ROOT / "output/fiq_retrieval/pytorch_model.bin.best.5")
+DEFAULT_CKPT = str(ROOT / "weights/fgsa/fashioniq/pytorch_model.bin")
 DEFAULT_DUAL = str(ROOT / "data/fashioniq/vision_desc/val_dual_targets.json")
 DEFAULT_OUT = str(ROOT / "output/fiq_vision_desc/refsim_fusion_v1")
 # FIQ-grid best text fusion (mean R@10≈38.58)

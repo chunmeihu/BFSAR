@@ -67,7 +67,7 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=0.07)
     p.add_argument("--early_stop_patience", type=int, default=6)
     p.add_argument("--fiq_categories", type=str, default="dress,shirt,toptee")
-    p.add_argument("--topk_dir", type=str, default=str(ROOT / "output/fiq_vision_desc"))
+    p.add_argument("--topk_dir", type=str, default=str(ROOT / "output/cqm/fashioniq"))
     p.add_argument("--val_max_queries", type=int, default=None)
     p.add_argument("--gallery_batch", type=int, default=8)
     p.add_argument("--resume", type=str, default=None)
@@ -239,16 +239,24 @@ def train(args, device: torch.device, rank: int, world_size: int, is_distributed
         args.topk_dir or "",
         args.resume or "",
     )
-    if args.validate_every <= 0 and not args.smoke:
-        raise ValueError("--validate_every must be > 0")
-    if not args.smoke and not args.exp_name and not args.resume:
-        raise ValueError("Pass --exp_name so FIQ QTR runs stay isolated.")
     if args.stage != "a":
         raise NotImplementedError(
             "FashionIQ CQM uses the contrastive composed-query loss."
         )
 
     cats = [x.strip() for x in args.fiq_categories.split(",") if x.strip()]
+    if is_main and not args.smoke:
+        from bfsar.mvr.cqm_val_pool import ensure_fiq_val_topk
+
+        args.topk_dir = str(
+            ensure_fiq_val_topk(
+                ROOT / "output" / "cqm" / "fashioniq",
+                device=str(device),
+            )
+        )
+    if is_distributed:
+        dist.barrier()
+
     model = build_blip2_qtr(
         device,
         pretrained_id=args.pretrained_id,
@@ -434,6 +442,9 @@ def train(args, device: torch.device, rank: int, world_size: int, is_distributed
                     best_r50 = r50
                     bad_vals = 0
                     _save_ckpt(ckpt_best, model, optim, scaler, epoch, args, best_r10)
+                    from bfsar.checkpoint_io import publish_checkpoint
+                    published = publish_checkpoint(ckpt_best, ROOT / "weights" / "cqm" / "fashioniq" / "cqm.pt")
+                    logger.info("Published best checkpoint to %s", published)
                     with open(out_dir / "best_val.json", "w", encoding="utf-8") as f:
                         json.dump(
                             {

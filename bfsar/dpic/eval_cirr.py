@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
-"""CIRR val coarse: entity-only FGSA retriever + dual-path SDR (frozen A7 α/β/w).
+"""CIRR coarse retrieval: entity-only FGSA and dual-path scores.
 
-Replaces 3-level BFSAR FGSA with fgsa_levels=1 matching (A3 Banzhaf or A2e no-Banzhaf),
-then the same RASD / DASD / dual fuse as mainline CIRR A7:
-
-  RASD: S_d=MIC, S_m=relative, S_r=ref↔gallery cosine
-  DASD: S_d=MIC, S_m=relative, S_r=vision_side FGSA
-  Dual:     w·z(RASD) + (1-w)·z(DASD)
-
-α/β/w are the mainline CIRR indep-best values (do not retune). Writes only under
-output/ablations/.
+RASD uses (alpha, beta) = (0.5, 0.2). DASD uses (0.2, 0.8). The path mix weight is 0.2.
 """
 
 from __future__ import annotations
@@ -33,6 +25,7 @@ from bfsar.cirr.openclip_backbone import install_openclip_cirr_patches
 
 install_openclip_cirr_patches()
 
+from bfsar.cirr import cirr_paths  # noqa: E402
 from bfsar.cirr.cirr_dataloader_builders import build_cirr_gallery_dataloader  # noqa: E402
 from bfsar.cirr.eval_fgsa import _similarity_matrix, encode_gallery  # noqa: E402
 from bfsar.cirr.modeling_fgsa import FGSAModel  # noqa: E402
@@ -56,7 +49,6 @@ W_REF = 0.2
 OPENCLIP_CKPT = ROOT / "weights/openclip/ViT-L-14-laion2B-s32B-b82K.pt"
 DEFAULT_CKPT = ROOT / "weights/fgsa/cirr/pytorch_model.bin"
 DEFAULT_OUT = ROOT / "output/dpic/cirr"
-DEFAULT_DUAL = ROOT / "data/cirr/vision_desc/val_dual_targets.json"
 
 
 def _find_best_ckpt(ckpt_dir: Path) -> Path:
@@ -91,6 +83,7 @@ def _pack_from_npz(path: Path) -> Dict:
         "refs": refs,
         "tgts": tgts,
         "groups": [list(g) for g in d["groups"].tolist()],
+        "pairids": [int(x) for x in d["pairids"].tolist()] if "pairids" in d.files else [],
     }
 
 
@@ -102,7 +95,8 @@ def encode_branches(model, args, tokenizer, device, out: Path) -> Path:
         return npz
 
     dataset = CIRRTripleVisionDataset(
-        str(args.dual_json), tokenizer, max_words=args.max_words, max_samples=None
+        str(args.dual_json), tokenizer, max_words=args.max_words, max_samples=None,
+        split=args.split,
     )
     loader = DataLoader(
         dataset,
@@ -112,9 +106,10 @@ def encode_branches(model, args, tokenizer, device, out: Path) -> Path:
         pin_memory=True,
         collate_fn=collate_fn,
     )
-    gallery_loader, n_g, _ = build_cirr_gallery_dataloader(args, split="val")
+    file_split = "test1" if args.split in ("test", "test1") else "val"
+    gallery_loader, n_g, _ = build_cirr_gallery_dataloader(args, split=file_split)
     print(
-        f"encode CIRR val: gallery={n_g} queries={len(dataset)} fgsa_levels={args.fgsa_levels}",
+        f"encode CIRR {args.split}: gallery={n_g} queries={len(dataset)} fgsa_levels={args.fgsa_levels}",
         flush=True,
     )
     gallery_feats, gallery_masks, index_names = encode_gallery(model, gallery_loader, device)
@@ -138,10 +133,11 @@ def encode_branches(model, args, tokenizer, device, out: Path) -> Path:
         refs=np.array(refs, dtype=object),
         tgts=np.array(tgts, dtype=object),
         groups=np.array(groups, dtype=object),
+        pairids=np.asarray([int(q["pairid"]) for q in dataset.queries], dtype=np.int64),
         index_names=np.array(index_names, dtype=object),
         dual_json=str(args.dual_json),
         init_model=str(args.ckpt),
-        ref_sim_mode="hbi_pool_gram",
+        ref_sim_mode="pool_gram",
         fgsa_levels=int(args.fgsa_levels),
     )
     print(f"wrote {npz}", flush=True)
@@ -149,6 +145,25 @@ def encode_branches(model, args, tokenizer, device, out: Path) -> Path:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return npz
+
+
+def coarse_matrix(pack: Dict) -> np.ndarray:
+    """Gallery scores used by multi-view reranking: w·RASD + (1-w)·DASD."""
+    rasd = score_path(pack["zd"], pack["zm"], pack["zr_ref"], ALPHA_REF, BETA_REF)
+    dasd = score_path(pack["zd"], pack["zm"], pack["zr_vis"], ALPHA_VIS, BETA_VIS)
+    return fuse_paths(rasd, dasd, W_REF)
+
+
+def write_coarse_sim(pack: Dict, path: Path) -> None:
+    dual = coarse_matrix(pack)
+    np.savez_compressed(
+        path,
+        sim=np.asarray(dual, dtype=np.float32),
+        refs=np.array(pack["refs"], dtype=object),
+        tgts=np.array(pack["tgts"], dtype=object),
+        index_names=np.array(pack["index_names"], dtype=object),
+        pairids=np.asarray(pack.get("pairids") or [], dtype=np.int64),
+    )
 
 
 def fuse_all(pack: Dict) -> Dict:
@@ -167,10 +182,12 @@ def fuse_all(pack: Dict) -> Dict:
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="CIRR entity-only + dual-path coarse (frozen A7 params)")
+    p = argparse.ArgumentParser(description="CIRR dual-path coarse retrieval")
+    p.add_argument("--split", choices=["val", "test"], default="val",
+                   help="val prints recall. test is CIRR test1 and has no local labels.")
     p.add_argument("--ckpt", default=str(DEFAULT_CKPT))
-    p.add_argument("--out_dir", default=str(DEFAULT_OUT))
-    p.add_argument("--dual_json", default=str(DEFAULT_DUAL))
+    p.add_argument("--out_dir", default=None)
+    p.add_argument("--dual_json", default=None)
     p.add_argument("--fgsa_levels", type=int, default=1, choices=[1, 3])
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--batch_size_val", type=int, default=8)
@@ -188,6 +205,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    file_split = "test1" if args.split == "test" else "val"
+    if not args.dual_json:
+        args.dual_json = cirr_paths.vision_dual_json(file_split)
+    if not args.out_dir:
+        args.out_dir = str(DEFAULT_OUT / args.split)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     ckpt = _find_best_ckpt(Path(args.ckpt))
@@ -231,6 +253,7 @@ def main():
         local_rank=0,
         image_resolution=224,
         gradient_checkpointing=1,
+        split=args.split,
         dual_json=args.dual_json,
         recompute=args.recompute,
         ckpt=str(ckpt),
@@ -254,12 +277,28 @@ def main():
         return
 
     pack = _pack_from_npz(out / "branch_sims.npz")
+    coarse_path = out / "coarse_sim.npz"
+    write_coarse_sim(pack, coarse_path)
+    print(f"wrote {coarse_path}", flush=True)
+    labeled = all(t and t in set(pack["index_names"]) for t in pack["tgts"])
+    if not labeled:
+        note = {
+            "split": args.split,
+            "dataset": "cirr",
+            "recall": None,
+            "note": "This split has no local target labels. Scores are in branch_sims.npz.",
+        }
+        (out / "metrics.json").write_text(json.dumps(note, indent=2) + "\n")
+        print(f"split={args.split}: no local labels, wrote scores to {out / 'branch_sims.npz'}", flush=True)
+        return
+
     fused = fuse_all(pack)
     dual = fused["dual_full"]
     payload = {
         "id": args.exp_id,
         "name": args.exp_name,
         "dataset": "cirr",
+        "split": args.split,
         "ckpt": str(ckpt),
         "fgsa_levels": args.fgsa_levels,
         "params": {
@@ -286,7 +325,7 @@ def main():
             flush=True,
         )
 
-    print("\n=== CIRR val | entity-only + dual (frozen A7 params) ===", flush=True)
+    print(f"\n=== CIRR {args.split} | dual-path coarse ===", flush=True)
     print(f"ckpt={ckpt}", flush=True)
     print(
         f"α_ref={ALPHA_REF} β_ref={BETA_REF} α_vis={ALPHA_VIS} β_vis={BETA_VIS} "

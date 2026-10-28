@@ -192,9 +192,9 @@ def rerank_all_categories(
         else:
             # Prefer pool size matching k_rerank (e.g. Top-500 compose41), else legacy Top-200.
             td = Path(topk_dir)
-            pt = td / f"hbi_top{int(k_rerank)}_val_{cat}.pt"
+            pt = td / f"coarse_top{int(k_rerank)}_val_{cat}.pt"
             if not pt.is_file():
-                pt = td / f"hbi_top200_val_{cat}.pt"
+                pt = td / f"coarse_top200_val_{cat}.pt"
         _abort_cirr(str(pt))
         if not pt.is_file():
             raise FileNotFoundError(f"Missing FIQ BFSAR top-k: {pt}")

@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
@@ -35,52 +35,6 @@ logger = logging.getLogger("train_cirr_blip2_qtr")
 DEFAULT_OUT = str(ROOT / "output/cqm/cirr")
 
 
-class CIRRTrainGroupHardNegs(Dataset):
-    """Wrap CIRR train-relative to also load group members as hard-neg images.
-
-    CIRR img_set typically has 6 members: ref + target + 4 visually similar others.
-    Those 4 are the extra ITM negatives (no train BFSAR top-k file exists).
-    """
-
-    def __init__(self, base_ds, n_hard: int = 4):
-        import PIL.Image
-
-        from bfsar.cirr import cirr_paths
-
-        self.base = base_ds
-        self.n_hard = int(n_hard)
-        self._pil = PIL.Image
-        # Same root CIRRDataset uses after hbi_blip_rerank remaps data_utils.base_path.
-        self.img_root = Path(cirr_paths.CIRR_DATASET_ROOT)
-
-    def __len__(self):
-        return len(self.base)
-
-    def _load_name(self, name: str):
-        path = self.img_root / self.base.name_to_relpath[name]
-        return self.base.preprocess(self._pil.open(path))
-
-    def __getitem__(self, index):
-        item = self.base[index]
-        if item is None:
-            return None
-        ref, tgt, cap = item
-        trip = self.base.triplets[index]
-        ref_name = trip["reference"]
-        tgt_name = trip["target_hard"]
-        members = [m for m in trip["img_set"]["members"] if m not in (ref_name, tgt_name)]
-        members = [m for m in members if m in self.base.name_to_relpath]
-        if not members:
-            others = [n for n in self.base.name_to_relpath if n not in (ref_name, tgt_name)]
-            members = others[: self.n_hard]
-        while members and len(members) < self.n_hard:
-            members.append(members[len(members) % len(members)])
-        negs = [self._load_name(m) for m in members[: self.n_hard]]
-        if not negs:
-            return None
-        return ref, tgt, cap, torch.stack(negs, dim=0)
-
-
 def parse_args():
     p = argparse.ArgumentParser(description="CIRR composed query matching (contrastive)")
     p.add_argument("--stage", type=str, default="a", choices=["a"], help="contrastive composed-query training")
@@ -93,72 +47,24 @@ def parse_args():
         help="Experiment folder under --output_dir (required for non-smoke).",
     )
     p.add_argument("--output_dir", type=str, default=DEFAULT_OUT)
-    p.add_argument("--epochs", type=int, default=60)
-    p.add_argument("--blip_max_epoch", type=int, default=50)
+    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--blip_max_epoch", type=int, default=40)
     p.add_argument("--lr", type=float, default=2e-5)
-    p.add_argument("--batch_size", type=int, default=8, help="Per-GPU")
+    p.add_argument("--batch_size", type=int, default=16, help="Per-GPU")
     p.add_argument("--blip_bs", type=int, default=8)
     p.add_argument("--blip_img_tune", action="store_true")
-    p.add_argument("--grad_accumulation_step", type=int, default=2)
+    p.add_argument("--grad_accumulation_step", type=int, default=1)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--topk_pt_val", type=str, default=str(DEFAULT_TOPK_VAL))
     p.add_argument("--k_val", type=int, default=50)
     p.add_argument("--validate_every", type=int, default=2)
     p.add_argument("--weight_decay", type=float, default=0.05)
-    p.add_argument("--temperature", type=float, default=0.07, help="Stage-A ITC temperature")
-    p.add_argument(
-        "--itm_temperature",
-        type=float,
-        default=1.0,
-        help="Stage-B: divide match logits by this before listwise CE",
-    )
-    p.add_argument(
-        "--label_smoothing",
-        type=float,
-        default=0.0,
-        help="Stage-B listwise CE label smoothing (recommended 0.1)",
-    )
-    p.add_argument(
-        "--hard_margin",
-        type=float,
-        default=0.0,
-        help="Stage-B: margin for hardest in-batch negative (0=off)",
-    )
-    p.add_argument(
-        "--hard_margin_weight",
-        type=float,
-        default=0.0,
-        help="Weight for hardest-neg margin loss",
-    )
-    p.add_argument(
-        "--gradient_checkpointing",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Checkpoint qformer_r (Stage-B, enables larger global B)",
-    )
+    p.add_argument("--temperature", type=float, default=0.07, help="Contrastive temperature")
     p.add_argument(
         "--early_stop_patience",
         type=int,
         default=0,
         help="Stop after N vals without best improvement (0=disabled)",
-    )
-    p.add_argument(
-        "--cqm_ckpt",
-        type=str,
-        default=None,
-        help="Stage-B: load Stage-A best/last weights before freezing cqm",
-    )
-    p.add_argument(
-        "--group_hard_negs",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Stage-B: append CIRR group members (excl. ref/target) as extra CE negatives",
-    )
-    p.add_argument(
-        "--n_group_hard_negs",
-        type=int,
-        default=4,
-        help="How many CIRR group members to use as hard negatives",
     )
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--reset_optimizer", action="store_true")
@@ -196,28 +102,12 @@ def _dump_exp_config(out_dir: Path, args, world_size: int) -> None:
         "grad_accumulation_step": args.grad_accumulation_step,
         "lr": args.lr,
         "temperature": args.temperature,
-        "itm_temperature": args.itm_temperature,
-        "label_smoothing": args.label_smoothing,
-        "hard_margin": args.hard_margin,
-        "hard_margin_weight": args.hard_margin_weight,
-        "gradient_checkpointing": args.gradient_checkpointing,
         "early_stop_patience": args.early_stop_patience,
         "blip_max_epoch": args.blip_max_epoch,
         "epochs": args.epochs,
         "k_val": args.k_val,
         "validate_every": args.validate_every,
         "topk_pt_val": args.topk_pt_val,
-        "cqm_ckpt": args.cqm_ckpt,
-        "group_hard_negs": args.group_hard_negs,
-        "n_group_hard_negs": args.n_group_hard_negs,
-        "target_pool_r1": "beat CQM 49.96, then 53, squeeze toward 55",
-        "stage_b_fixes": [
-            "freeze embeddings (stop q* drift)",
-            "CIRR group members as extra ITM hard-negs",
-            "hardest-neg margin loss",
-            "label smoothing",
-            "native BLIP-2 ITM (not Twin-from-scratch)",
-        ],
     }
     with open(out_dir / "exp_config.json", "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -238,34 +128,6 @@ def _init_distributed() -> tuple[int, int, int, bool]:
 
 def _unwrap(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
-
-
-def _stage_b_loss(
-    logits: torch.Tensor,
-    gt: torch.Tensor,
-    *,
-    temperature: float,
-    label_smoothing: float,
-    hard_margin: float,
-    hard_margin_weight: float,
-) -> tuple[torch.Tensor, float, float]:
-    """Listwise CE + optional hardest-negative margin (no extra forward)."""
-    import torch.nn.functional as F
-
-    ce = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-    temp = max(float(temperature), 1e-6)
-    loss_ce = ce(logits / temp, gt)
-    loss_hard = logits.new_zeros(())
-    if hard_margin_weight > 0 and hard_margin >= 0:
-        b = logits.size(0)
-        rows = torch.arange(b, device=logits.device)
-        pos = logits[rows, gt]
-        neg = logits.clone()
-        neg[rows, gt] = -1e4
-        hard_neg, _ = neg.max(dim=1)
-        loss_hard = F.relu(hard_neg - pos + hard_margin).mean()
-    loss = loss_ce + hard_margin_weight * loss_hard
-    return loss, float(loss_ce.detach()), float(loss_hard.detach())
 
 
 def _cosine_lr(optimizer, epoch: int, max_epoch: int, init_lr: float, min_lr: float = 0.0) -> float:
@@ -331,7 +193,6 @@ def _save_ckpt(path: Path, model, optim, scaler, epoch: int, args, best_r1: floa
         "global_contrastive": args.global_contrastive,
         "temperature": args.temperature,
         "exp_name": args.exp_name,
-        "cqm_ckpt": args.cqm_ckpt,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -342,7 +203,7 @@ def _save_ckpt(path: Path, model, optim, scaler, epoch: int, args, best_r1: floa
 @torch.no_grad()
 def _validate_pool(args, device, model: nn.Module) -> dict:
     torch.cuda.empty_cache()
-    score_mode = "itc" if args.stage == "a" else "itm"
+    score_mode = "itc"
     out = run_cirr_blip2_qtr_rerank(
         Path(args.topk_pt_val),
         split="val",
@@ -369,13 +230,17 @@ def _validate_pool(args, device, model: nn.Module) -> dict:
 
 def train(args, device: torch.device, rank: int, world_size: int, is_distributed: bool) -> None:
     is_main = rank == 0
-    if args.validate_every <= 0 and not args.smoke:
-        raise ValueError("--validate_every must be > 0")
-    if not args.smoke and not args.exp_name and not args.resume:
-        raise ValueError("Pass --exp_name so Stage-A/B runs stay isolated.")
+    if is_main and not args.smoke:
+        from bfsar.mvr.cqm_val_pool import ensure_cirr_val_topk
 
-    if args.stage == "b" and not args.resume and not args.cqm_ckpt and not args.smoke:
-        raise ValueError("Stage-B requires --cqm_ckpt (Stage-A best) or --resume")
+        args.topk_pt_val = str(
+            ensure_cirr_val_topk(
+                ROOT / "output" / "cqm" / "cirr" / "val_top200.pt",
+                device=str(device),
+            )
+        )
+    if is_distributed:
+        dist.barrier()
 
     model = build_blip2_qtr(
         device,
@@ -385,26 +250,7 @@ def train(args, device: torch.device, rank: int, world_size: int, is_distributed
         stage=args.stage,
     )
 
-    # Stage-B: load cqm weights then re-freeze.
-    if args.stage == "b" and args.cqm_ckpt:
-        ck = Path(args.cqm_ckpt)
-        if not ck.is_file():
-            raise FileNotFoundError(f"cqm_ckpt not found: {ck}")
-        missing, unexpected = load_blip2_qtr_ckpt(_unwrap(model), str(ck), device)
-        if is_main:
-            logger.info(
-                "Loaded Stage-A cqm from %s (missing=%d unexpected=%d)",
-                ck,
-                len(missing),
-                len(unexpected),
-            )
-        model.set_stage("b")  # freeze cqm again after load
-
-    if args.gradient_checkpointing and args.stage == "b":
-        _unwrap(model).enable_qformer_r_checkpointing()
-
     if is_distributed:
-        # Stage-A freezes reranker; Stage-B freezes cqm → unused params.
         model = DDP(
             model,
             device_ids=[device.index],
@@ -436,13 +282,6 @@ def train(args, device: torch.device, rank: int, world_size: int, is_distributed
     os.chdir(CR_SRC)
     try:
         train_ds = CIRRDataset("train", "relative", preprocess)
-        if args.stage == "b" and args.group_hard_negs:
-            train_ds = CIRRTrainGroupHardNegs(train_ds, n_hard=args.n_group_hard_negs)
-            if is_main:
-                logger.info(
-                    "Stage-B group hard-negs ON (n=%d per query, excl. ref/target)",
-                    args.n_group_hard_negs,
-                )
     finally:
         os.chdir(REPO_ROOT)
 
@@ -512,15 +351,8 @@ def train(args, device: torch.device, rank: int, world_size: int, is_distributed
         model.train()
         if not args.blip_img_tune:
             _unwrap(model).vision_model.eval()
-        # Keep frozen cqm in eval for Stage-B BN/dropout stability.
-        if args.stage == "b":
-            raw_b = _unwrap(model)
-            raw_b.qformer_c.eval()
-            raw_b.embeddings.eval()
 
         total_loss = 0.0
-        total_ce = 0.0
-        total_hm = 0.0
         n_steps = 0
         optim.zero_grad(set_to_none=True)
         it = tqdm(loader, desc=f"qtr-{args.stage} ep{epoch}", ncols=88) if is_main else loader
@@ -530,11 +362,7 @@ def train(args, device: torch.device, rank: int, world_size: int, is_distributed
             if args.smoke and idx >= 20:
                 break
 
-            hard_imgs = None
-            if args.stage == "b" and args.group_hard_negs:
-                ref_imgs, tgt_imgs, captions, hard_imgs = batch
-            else:
-                ref_imgs, tgt_imgs, captions = batch
+            ref_imgs, tgt_imgs, captions = batch
 
             ref_imgs = ref_imgs.to(device, non_blocking=True)
             tgt_imgs = tgt_imgs.to(device, non_blocking=True)
@@ -542,13 +370,6 @@ def train(args, device: torch.device, rank: int, world_size: int, is_distributed
 
             ref_feats = _embed_images(model, ref_imgs, args.blip_bs, args.blip_img_tune)
             tgt_feats = _embed_images(model, tgt_imgs, args.blip_bs, args.blip_img_tune)
-            hard_feats = None
-            if hard_imgs is not None:
-                hard_imgs = hard_imgs.to(device, non_blocking=True)
-                g_hard = hard_imgs.size(1)
-                hard_flat = hard_imgs.reshape(b * g_hard, *hard_imgs.shape[2:])
-                hard_flat_feats = _embed_images(model, hard_flat, args.blip_bs, False)
-                hard_feats = hard_flat_feats.view(b, g_hard, *hard_flat_feats.shape[1:])
 
             with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
                 use_global = is_distributed and args.global_contrastive
@@ -562,14 +383,12 @@ def train(args, device: torch.device, rank: int, world_size: int, is_distributed
                     logits_rows = logits_full[off : off + b]
                     gt = torch.arange(off, off + b, device=device, dtype=torch.long)
                     loss_raw = ce_a(logits_rows, gt)
-                    ce_v, hm_v = float(loss_raw.detach()), 0.0
                 else:
                     logits = raw.stage_a_logits_scaled(
                         ref_feats, tgt_feats, captions, temperature=args.temperature
                     )
                     gt = torch.arange(b, device=device, dtype=torch.long)
                     loss_raw = ce_a(logits, gt)
-                    ce_v, hm_v = float(loss_raw.detach()), 0.0
                 loss = loss_raw / args.grad_accumulation_step
 
             scaler.scale(loss).backward()
@@ -579,24 +398,13 @@ def train(args, device: torch.device, rank: int, world_size: int, is_distributed
                 optim.zero_grad(set_to_none=True)
 
             total_loss += float(loss_raw.item())
-            total_ce += ce_v
-            total_hm += hm_v
             n_steps += 1
 
         if is_distributed:
             dist.barrier()
 
         if is_main:
-            if args.stage == "b":
-                logger.info(
-                    "epoch %d train loss %.4f (ce %.4f hard_m %.4f)",
-                    epoch,
-                    total_loss / max(n_steps, 1),
-                    total_ce / max(n_steps, 1),
-                    total_hm / max(n_steps, 1),
-                )
-            else:
-                logger.info("epoch %d train CE %.4f", epoch, total_loss / max(n_steps, 1))
+            logger.info("epoch %d train CE %.4f", epoch, total_loss / max(n_steps, 1))
             _save_ckpt(ckpt_last, model, optim, scaler, epoch, args, best_r1)
 
             if args.validate_every > 0 and (epoch % args.validate_every == 0 or args.smoke):
@@ -607,15 +415,14 @@ def train(args, device: torch.device, rank: int, world_size: int, is_distributed
                     model.train()
                     if not args.blip_img_tune:
                         _unwrap(model).vision_model.eval()
-                    if args.stage == "b":
-                        _unwrap(model).qformer_c.eval()
-                        _unwrap(model).embeddings.eval()
                 r1 = float(pm.get("pool_recall_at1", -1))
                 if r1 > best_r1:
                     best_r1 = r1
                     bad_vals = 0
                     _save_ckpt(ckpt_best, model, optim, scaler, epoch, args, best_r1)
-                    logger.info("New best val pool R@1=%.2f", r1)
+                    from bfsar.checkpoint_io import publish_checkpoint
+                    published = publish_checkpoint(ckpt_best, ROOT / "weights" / "cqm" / "cirr" / "cqm.pt")
+                    logger.info("New best val pool R@1=%.2f -> %s", r1, published)
                 else:
                     bad_vals += 1
                     logger.info(

@@ -24,9 +24,25 @@ DEFAULT_FIQ_STAGE1 = CVS_WEIGHTS / "fashioniq" / "stage1.pt"
 DEFAULT_FIQ_STAGE2 = CVS_WEIGHTS / "fashioniq" / "stage2.pt"
 
 DEFAULT_CIRR_TOPK_VAL = REPO_ROOT / "output" / "topk" / "cirr_top_200_val.pt"
-DEFAULT_CIRR_TOPK_TEST1 = REPO_ROOT / "output" / "topk" / "cirr_top_200_test1.pt"
 
 CQM_CIRR_DEFAULT = REPO_ROOT / "weights" / "cqm" / "cirr" / "cqm.pt"
 CQM_FIQ_DEFAULT = REPO_ROOT / "weights" / "cqm" / "fashioniq" / "cqm.pt"
 COMPOSER_CIRR_DEFAULT = CQM_CIRR_DEFAULT
 COMPOSER_FIQ_DEFAULT = CQM_FIQ_DEFAULT
+
+BLIP2_ITM_DIR = REPO_ROOT / "weights" / "blip2" / "blip2-itm-vit-g"
+BERT_DIR = REPO_ROOT / "weights" / "bert" / "bert-base-uncased"
+BLIP2_ITM_HUB = "Salesforce/blip2-itm-vit-g"
+
+
+def blip2_pretrained_id(requested: str | None = None) -> str:
+    """Prefer the copy under weights/blip2 over the Hugging Face hub id."""
+    local = BLIP2_ITM_DIR
+    ready = (local / "config.json").is_file() and (local / "model.safetensors").is_file()
+    if requested and Path(requested).is_dir():
+        return str(Path(requested))
+    if ready and requested in (None, "", BLIP2_ITM_HUB):
+        return str(local)
+    if requested:
+        return requested
+    return str(local) if ready else BLIP2_ITM_HUB

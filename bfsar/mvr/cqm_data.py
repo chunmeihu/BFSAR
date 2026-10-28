@@ -20,7 +20,7 @@ from bfsar.mvr.cvs_infer import (
     _import_blip_modules,
 )
 
-logger = logging.getLogger("hbi_blip2_rerank")
+logger = logging.getLogger("bfsar_cqm")
 
 
 @torch.no_grad()

@@ -1,13 +1,16 @@
 """Default filesystem paths for CIRR data.
 
-Dataset lives under ``<repo>/data/cirr``:
-  - cirr_dataset/cirr/{captions,image_splits,captions_ext}
-  - cirr_dataset/{train,dev,test1} -> ../img_raw/...  (CR/BLIP layout)
-  - img_raw/{train,dev,test1}  (BFSAR image root)
-  - llm_data/
-  - vision_desc/
+Images and official annotations live in one folder, ``data/cirr/cirr_dataset``:
 
-Override with ``CIRR_DATA_ROOT`` / ``CIRR_IMAGE_ROOT`` / ``CIRR_DATASET_ROOT`` if needed.
+  cirr_dataset/train|dev|test1     images from the official release
+  cirr_dataset/cirr/captions
+  cirr_dataset/cirr/image_splits
+  llm_data/                         target captions included in this repo
+  vision_desc/                      vision-side captions included in this repo
+
+``img_raw`` is only a fallback for an older local copy whose images were
+stored outside ``cirr_dataset``. Override with ``CIRR_DATA_ROOT``,
+``CIRR_IMAGE_ROOT``, or ``CIRR_DATASET_ROOT`` if needed.
 """
 
 from __future__ import annotations
@@ -29,8 +32,23 @@ CIRR_LLM_DIR = os.environ.get("CIRR_LLM_DIR", os.path.join(CIRR_DATA_ROOT, "llm_
 CIRR_VISION_DESC_DIR = os.path.join(CIRR_DATA_ROOT, "vision_desc")
 CIRR_VISION_OUT_DIR = os.path.join(REPO_ROOT, "output", "cirr_vision_desc")
 
-# split json paths are relative to img_raw (e.g. ./dev/dev-244-0-img0.png)
-CIRR_IMAGE_ROOT = os.environ.get("CIRR_IMAGE_ROOT", os.path.join(CIRR_DATA_ROOT, "img_raw"))
+def _default_image_root() -> str:
+    """Official release keeps images inside cirr_dataset. Fall back to img_raw."""
+    chosen = os.environ.get("CIRR_IMAGE_ROOT")
+    if chosen:
+        return chosen
+    official = CIRR_DATASET_ROOT
+    legacy = os.path.join(CIRR_DATA_ROOT, "img_raw")
+    if os.path.isdir(os.path.join(official, "dev")) or os.path.isdir(os.path.join(official, "train")):
+        return official
+    if os.path.isdir(legacy):
+        return legacy
+    return official
+
+
+# Split json paths are relative to this root, e.g. ./dev/dev-244-0-img0.png
+# or ./train/34/train-11041-2-img0.png.
+CIRR_IMAGE_ROOT = _default_image_root()
 
 CLIP_IN_REPO = os.path.join(REPO_ROOT, "weights", "clip", "ViT-L-14.pt")
 CLIP_VITL14_CHECKPOINT = os.environ.get(

@@ -10,7 +10,6 @@ os.environ['MKL_NUM_THREADS'] = num_numpy_threads
 os.environ['NUMEXPR_NUM_THREADS'] = num_numpy_threads
 os.environ['OMP_NUM_THREADS'] = num_numpy_threads
 
-from comet_ml import Experiment
 import json
 import multiprocessing
 from argparse import ArgumentParser
@@ -26,10 +25,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import math
 
-from data_utils import base_path, _CR_PKG, squarepad_transform, FashionIQDataset, targetpad_transform, CIRRDataset
+from data_utils import base_path, squarepad_transform, FashionIQDataset, targetpad_transform, CIRRDataset
 from blip_stage1 import blip_stage1
 from utils import collate_fn, update_train_running_results, set_train_bar_description, save_model, \
-    extract_index_features, generate_randomized_fiq_caption, device, cosine_lr_schedule
+    extract_index_features, generate_randomized_fiq_caption, device, cosine_lr_schedule, publish_cvs_stage
 from validate import compute_cirr_val_metrics, compute_fiq_val_metrics
 
 import warnings
@@ -134,157 +133,146 @@ def stage1_training_fiq(train: bool,
         if train:
             relative_train_loader.dataset.epoch_count = epoch
             print(f"[{datetime.now()}] Training ...")
-            updated_lr = cosine_lr_schedule(optimizer, epoch, blip_max_epoch, blip_learning_rate, config['min_lr'])
-            try: experiment.log_metric('epoch_lr', updated_lr, epoch=epoch)
-            except: pass
+            cosine_lr_schedule(optimizer, epoch, blip_max_epoch, blip_learning_rate, config['min_lr'])
 
-            with experiment.train():
-                train_running_results = {'images_in_epoch': 0, 'accumulated_train_loss': 0}
+            train_running_results = {'images_in_epoch': 0, 'accumulated_train_loss': 0}
 
-                model.train()
-                train_bar = tqdm(relative_train_loader, ncols=75)
-                for idx, (reference_images, target_images, captions,) in enumerate(train_bar):  # Load a batch of triplets
-                    step = len(train_bar) * epoch + idx
-                    images_in_batch = reference_images.size(0)
+            model.train()
+            train_bar = tqdm(relative_train_loader, ncols=75)
+            for idx, (reference_images, target_images, captions,) in enumerate(train_bar):  # Load a batch of triplets
+                images_in_batch = reference_images.size(0)
 
-                    optimizer.zero_grad()
+                optimizer.zero_grad()
 
-                    # prepare text
-                    # Randomize the training caption in four way: (a) cap1 and cap2 (b) cap2 and cap1 (c) cap1 (d) cap2
-                    flattened_captions: list = np.array(captions).T.flatten().tolist()
-                    input_captions = generate_randomized_fiq_caption(flattened_captions)
-                    # prepare target
-                    ground_truth = torch.arange(images_in_batch, dtype=torch.long, device=device)
-                    # embed images
-                    reference_images = reference_images.to(device, non_blocking=True)
-                    target_images = target_images.to(device, non_blocking=True)
-                    if not blip_img_tune:
-                        with torch.no_grad():
-                            reference_images_list = torch.split(reference_images, blip_bs)
-                            reference_image_features = torch.vstack(
-                                [model.img_embed(mini_batch).float() for mini_batch in reference_images_list])
-                            target_images_list = torch.split(target_images, blip_bs)
-                            target_image_features = torch.vstack(
-                                [model.img_embed(mini_batch, return_pool_and_normalized=True)[-1].float() for mini_batch in target_images_list])
-                    else:
-                        with torch.cuda.amp.autocast():
-                            reference_images_list = torch.split(reference_images, blip_bs)
-                            reference_image_features = torch.vstack(
-                                [model.img_embed(mini_batch).float() for mini_batch in reference_images_list])
-                            target_images_list = torch.split(target_images, blip_bs)
-                            target_image_features = torch.vstack(
-                                [model.img_embed(mini_batch, return_pool_and_normalized=True)[-1].float() for mini_batch in target_images_list])
-
-                    # Compute the logits and the loss
+                # prepare text
+                # Randomize the training caption in four way: (a) cap1 and cap2 (b) cap2 and cap1 (c) cap1 (d) cap2
+                flattened_captions: list = np.array(captions).T.flatten().tolist()
+                input_captions = generate_randomized_fiq_caption(flattened_captions)
+                # prepare target
+                ground_truth = torch.arange(images_in_batch, dtype=torch.long, device=device)
+                # embed images
+                reference_images = reference_images.to(device, non_blocking=True)
+                target_images = target_images.to(device, non_blocking=True)
+                if not blip_img_tune:
+                    with torch.no_grad():
+                        reference_images_list = torch.split(reference_images, blip_bs)
+                        reference_image_features = torch.vstack(
+                            [model.img_embed(mini_batch).float() for mini_batch in reference_images_list])
+                        target_images_list = torch.split(target_images, blip_bs)
+                        target_image_features = torch.vstack(
+                            [model.img_embed(mini_batch, return_pool_and_normalized=True)[-1].float() for mini_batch in target_images_list])
+                else:
                     with torch.cuda.amp.autocast():
-                        logits = model.img_txt_fusion(reference_image_features, target_image_features, input_captions, train=True)
-                        ground_truth = torch.arange(images_in_batch, dtype=torch.long, device=device)
-                        loss_raw = crossentropy_criterion(logits, ground_truth)
+                        reference_images_list = torch.split(reference_images, blip_bs)
+                        reference_image_features = torch.vstack(
+                            [model.img_embed(mini_batch).float() for mini_batch in reference_images_list])
+                        target_images_list = torch.split(target_images, blip_bs)
+                        target_image_features = torch.vstack(
+                            [model.img_embed(mini_batch, return_pool_and_normalized=True)[-1].float() for mini_batch in target_images_list])
 
-                        loss = loss_raw
+                # Compute the logits and the loss
+                with torch.cuda.amp.autocast():
+                    logits = model.img_txt_fusion(reference_image_features, target_image_features, input_captions, train=True)
+                    ground_truth = torch.arange(images_in_batch, dtype=torch.long, device=device)
+                    loss_raw = crossentropy_criterion(logits, ground_truth)
 
-                    loss /= grad_accumulation_step
-                    # Backprogate and update the weights
-                    scaler.scale(loss).backward()
-                    if ((idx + 1) % grad_accumulation_step == 0) or (idx + 1 == len(relative_train_loader)):
-                        scaler.step(optimizer)
-                        scaler.update()
+                    loss = loss_raw
 
-                    experiment.log_metric('step_loss', loss.detach().cpu().item(), step=step)
-                    experiment.log_metric('step_loss_raw', loss_raw.detach().cpu().item(), step=step)
-                    update_train_running_results(train_running_results, loss, images_in_batch)
-                    set_train_bar_description(train_bar, epoch, num_epochs, train_running_results)
+                loss /= grad_accumulation_step
+                # Backprogate and update the weights
+                scaler.scale(loss).backward()
+                if ((idx + 1) % grad_accumulation_step == 0) or (idx + 1 == len(relative_train_loader)):
+                    scaler.step(optimizer)
+                    scaler.update()
 
-                train_epoch_loss = float(
-                    train_running_results['accumulated_train_loss'] / train_running_results['images_in_epoch'])
-                experiment.log_metric('epoch_loss', train_epoch_loss, epoch=epoch)
+                update_train_running_results(train_running_results, loss, images_in_batch)
+                set_train_bar_description(train_bar, epoch, num_epochs, train_running_results)
 
-                # Training CSV logging
-                training_log_frame = pd.concat(
-                    [training_log_frame,
-                    pd.DataFrame(data={'epoch': epoch, 'train_epoch_loss': train_epoch_loss}, index=[0])])
-                training_log_frame.to_csv(str(training_path / 'train_metrics.csv'), index=False)
+            train_epoch_loss = float(
+                train_running_results['accumulated_train_loss'] / train_running_results['images_in_epoch'])
 
-                print(f"{training_path}")
+            # Training CSV logging
+            training_log_frame = pd.concat(
+                [training_log_frame,
+                pd.DataFrame(data={'epoch': epoch, 'train_epoch_loss': train_epoch_loss}, index=[0])])
+            training_log_frame.to_csv(str(training_path / 'train_metrics.csv'), index=False)
+
+            print(f"{training_path}")
 
         if epoch % validation_frequency == 0:
             print(f"[{datetime.now()}] Validating...")
             torch.cuda.empty_cache()
-            with experiment.validate():
-                with torch.no_grad():
-                    model.eval()
-                    recalls_at10 = []
-                    recalls_at50 = []
+            with torch.no_grad():
+                model.eval()
+                recalls_at10 = []
+                recalls_at50 = []
 
-                    if blip_img_tune or (not preprocess_val): # image encoder being updated, refresh features
-                        idx_to_dress_mapping = {}
-                        relative_val_datasets = []
-                        index_features_list = []
-                        index_features_normed_pooled_list = []
-                        index_names_list = []
+                if blip_img_tune or (not preprocess_val): # image encoder being updated, refresh features
+                    idx_to_dress_mapping = {}
+                    relative_val_datasets = []
+                    index_features_list = []
+                    index_features_normed_pooled_list = []
+                    index_names_list = []
 
-                        for idx, dress_type in enumerate(val_dress_types):
-                            idx_to_dress_mapping[idx] = dress_type
-                            relative_val_dataset = FashionIQDataset('val', [dress_type], 'relative', preprocess)
-                            relative_val_datasets.append(relative_val_dataset)
-                            classic_val_dataset = FashionIQDataset('val', [dress_type], 'classic', preprocess)
-                            index_features_and_names = extract_index_features(classic_val_dataset, model, blip_stage1=True)
-                            index_features_list.append(index_features_and_names[0])
-                            index_features_normed_pooled_list.append(index_features_and_names[1])
-                            index_names_list.append(index_features_and_names[2])
-                            torch.cuda.empty_cache()
+                    for idx, dress_type in enumerate(val_dress_types):
+                        idx_to_dress_mapping[idx] = dress_type
+                        relative_val_dataset = FashionIQDataset('val', [dress_type], 'relative', preprocess)
+                        relative_val_datasets.append(relative_val_dataset)
+                        classic_val_dataset = FashionIQDataset('val', [dress_type], 'classic', preprocess)
+                        index_features_and_names = extract_index_features(classic_val_dataset, model, blip_stage1=True)
+                        index_features_list.append(index_features_and_names[0])
+                        index_features_normed_pooled_list.append(index_features_and_names[1])
+                        index_names_list.append(index_features_and_names[2])
+                        torch.cuda.empty_cache()
 
-                    # Compute and log validation metrics for each validation dataset (which corresponds to a different
-                    # FashionIQ category)
-                    for relative_val_dataset, index_features, index_features_normed_pooled, index_names, idx in zip(relative_val_datasets,
-                                                                                    index_features_list,
-                                                                                    index_features_normed_pooled_list, 
-                                                                                    index_names_list,
-                                                                                    idx_to_dress_mapping):
-                        recall_at10, recall_at50 = compute_fiq_val_metrics(relative_val_dataset, model, 
-                                                                           index_features, index_features_normed_pooled,
-                                                                           index_names)
-                        recalls_at10.append(recall_at10)
-                        recalls_at50.append(recall_at50)
+                # Compute and log validation metrics for each validation dataset (which corresponds to a different
+                # FashionIQ category)
+                for relative_val_dataset, index_features, index_features_normed_pooled, index_names, idx in zip(relative_val_datasets,
+                                                                                index_features_list,
+                                                                                index_features_normed_pooled_list, 
+                                                                                index_names_list,
+                                                                                idx_to_dress_mapping):
+                    recall_at10, recall_at50 = compute_fiq_val_metrics(relative_val_dataset, model, 
+                                                                       index_features, index_features_normed_pooled,
+                                                                       index_names)
+                    recalls_at10.append(recall_at10)
+                    recalls_at50.append(recall_at50)
 
-                    torch.cuda.empty_cache()
-                    results_dict = {}
-                    for i in range(len(recalls_at10)):
-                        results_dict[f'{idx_to_dress_mapping[i]}_recall_at10'] = recalls_at10[i]
-                        results_dict[f'{idx_to_dress_mapping[i]}_recall_at50'] = recalls_at50[i]
-                    results_dict.update({
-                        f'average_recall_at10': mean(recalls_at10),
-                        f'average_recall_at50': mean(recalls_at50),
-                        f'average_recall': (mean(recalls_at50) + mean(recalls_at10)) / 2
-                    })
+                torch.cuda.empty_cache()
+                results_dict = {}
+                for i in range(len(recalls_at10)):
+                    results_dict[f'{idx_to_dress_mapping[i]}_recall_at10'] = recalls_at10[i]
+                    results_dict[f'{idx_to_dress_mapping[i]}_recall_at50'] = recalls_at50[i]
+                results_dict.update({
+                    f'average_recall_at10': mean(recalls_at10),
+                    f'average_recall_at50': mean(recalls_at50),
+                    f'average_recall': (mean(recalls_at50) + mean(recalls_at10)) / 2
+                })
 
-                    print(json.dumps(results_dict, indent=4))
-                    experiment.log_metrics(
-                        results_dict,
-                        epoch=epoch
-                    )
+                print(json.dumps(results_dict, indent=4))
 
-                    # Validation CSV logging
-                    log_dict = {'epoch': epoch}
-                    log_dict.update(results_dict)
-                    validation_log_frame = pd.concat([validation_log_frame, pd.DataFrame(data=log_dict, index=[0])])
-                    validation_log_frame.to_csv(str(training_path / 'validation_metrics.csv'), index=False)
+                # Validation CSV logging
+                log_dict = {'epoch': epoch}
+                log_dict.update(results_dict)
+                validation_log_frame = pd.concat([validation_log_frame, pd.DataFrame(data=log_dict, index=[0])])
+                validation_log_frame.to_csv(str(training_path / 'validation_metrics.csv'), index=False)
 
-                if not preprocess_val: # manually free up VRAM
-                    del index_features_list
-                    del index_features_normed_pooled_list
-                    torch.cuda.empty_cache()
+            if not preprocess_val: # manually free up VRAM
+                del index_features_list
+                del index_features_normed_pooled_list
+                torch.cuda.empty_cache()
 
-                # Save model
-                if save_training and train: # don't save ckpt if only validating
-                    save_model('blip_last', epoch, model, training_path, optimizer)
-                    if save_best and results_dict['average_recall'] > best_avg_recall:
-                        best_avg_recall = results_dict['average_recall']
-                        save_model('blip', epoch, model, training_path, optimizer)
-                    elif not save_best:
-                        save_model(f'blip_{epoch}', epoch, model, training_path, optimizer)
+            # Save model
+            if save_training and train: # don't save ckpt if only validating
+                save_model('blip_last', epoch, model, training_path, optimizer)
+                if save_best and results_dict['average_recall'] > best_avg_recall:
+                    best_avg_recall = results_dict['average_recall']
+                    save_model('blip', epoch, model, training_path, optimizer)
+                    publish_cvs_stage(training_path, 'blip', 1)
+                elif not save_best:
+                    save_model(f'blip_{epoch}', epoch, model, training_path, optimizer)
 
-                    print(f"{training_path}/saved_models/blip.pt")
+                print(f"{training_path}/saved_models/blip.pt")
             
             if not train:
                 exit()
@@ -373,149 +361,136 @@ def stage1_training_cirr(train: bool,
         if train:
             relative_train_loader.dataset.epoch_count = epoch
             print(f"[{datetime.now()}] Training ...")
-            updated_lr = cosine_lr_schedule(optimizer, epoch, blip_max_epoch, blip_learning_rate, config['min_lr'])
-            try: experiment.log_metric('epoch_lr', updated_lr, epoch=epoch)
-            except: pass
+            cosine_lr_schedule(optimizer, epoch, blip_max_epoch, blip_learning_rate, config['min_lr'])
 
-            with experiment.train():
-                train_running_results = {'images_in_epoch': 0, 'accumulated_train_loss': 0}
+            train_running_results = {'images_in_epoch': 0, 'accumulated_train_loss': 0}
                 
-                model.train()
-                train_bar = tqdm(relative_train_loader, ncols=75)
-                for idx, (reference_images, target_images, captions,) in enumerate(train_bar):  # Load a batch of triplets
-                    images_in_batch = reference_images.size(0)
-                    step = len(train_bar) * epoch + idx
+            model.train()
+            train_bar = tqdm(relative_train_loader, ncols=75)
+            for idx, (reference_images, target_images, captions,) in enumerate(train_bar):  # Load a batch of triplets
+                images_in_batch = reference_images.size(0)
 
-                    optimizer.zero_grad()
+                optimizer.zero_grad()
 
-                    # prepare target
-                    ground_truth = torch.arange(images_in_batch, dtype=torch.long, device=device)
-                    # embed images
-                    reference_images = reference_images.to(device, non_blocking=True)
-                    target_images = target_images.to(device, non_blocking=True)
-                    if not blip_img_tune:
-                        with torch.no_grad():
-                            reference_images_list = torch.split(reference_images, blip_bs)
-                            reference_features = torch.vstack(
-                                [model.img_embed(mini_batch).float() for mini_batch in reference_images_list])
-                            target_images_list = torch.split(target_images, blip_bs)
-                            target_features = torch.vstack(
-                                [model.img_embed(mini_batch, return_pool_and_normalized=True)[-1].float() for mini_batch in target_images_list])
-                    else:
-                        with torch.cuda.amp.autocast():
-                            reference_images_list = torch.split(reference_images, blip_bs)
-                            reference_features = torch.vstack(
-                                [model.img_embed(mini_batch).float() for mini_batch in reference_images_list])
-                            target_images_list = torch.split(target_images, blip_bs)
-                            target_features = torch.vstack(
-                                [model.img_embed(mini_batch, return_pool_and_normalized=True)[-1].float() for mini_batch in target_images_list])
-
-                    # Compute the logits and loss
+                # prepare target
+                ground_truth = torch.arange(images_in_batch, dtype=torch.long, device=device)
+                # embed images
+                reference_images = reference_images.to(device, non_blocking=True)
+                target_images = target_images.to(device, non_blocking=True)
+                if not blip_img_tune:
+                    with torch.no_grad():
+                        reference_images_list = torch.split(reference_images, blip_bs)
+                        reference_features = torch.vstack(
+                            [model.img_embed(mini_batch).float() for mini_batch in reference_images_list])
+                        target_images_list = torch.split(target_images, blip_bs)
+                        target_features = torch.vstack(
+                            [model.img_embed(mini_batch, return_pool_and_normalized=True)[-1].float() for mini_batch in target_images_list])
+                else:
                     with torch.cuda.amp.autocast():
-                        logits = model.img_txt_fusion(reference_features, target_features, captions, train=True)
-                        ground_truth = torch.arange(images_in_batch, dtype=torch.long, device=device)
-                        loss_raw = crossentropy_criterion(logits, ground_truth)
+                        reference_images_list = torch.split(reference_images, blip_bs)
+                        reference_features = torch.vstack(
+                            [model.img_embed(mini_batch).float() for mini_batch in reference_images_list])
+                        target_images_list = torch.split(target_images, blip_bs)
+                        target_features = torch.vstack(
+                            [model.img_embed(mini_batch, return_pool_and_normalized=True)[-1].float() for mini_batch in target_images_list])
 
-                        loss = loss_raw
+                # Compute the logits and loss
+                with torch.cuda.amp.autocast():
+                    logits = model.img_txt_fusion(reference_features, target_features, captions, train=True)
+                    ground_truth = torch.arange(images_in_batch, dtype=torch.long, device=device)
+                    loss_raw = crossentropy_criterion(logits, ground_truth)
 
-                    loss /= grad_accumulation_step
-                    # Backpropagate and update the weights
-                    scaler.scale(loss).backward()
-                    if ((idx + 1) % grad_accumulation_step == 0) or (idx + 1 == len(relative_train_loader)):
-                        scaler.step(optimizer)
-                        scaler.update()
+                    loss = loss_raw
 
-                    experiment.log_metric('step_loss', loss.detach().cpu().item(), step=step)
-                    experiment.log_metric('step_loss_raw', loss_raw.detach().cpu().item(), step=step)
-                    update_train_running_results(train_running_results, loss, images_in_batch)
-                    set_train_bar_description(train_bar, epoch, num_epochs, train_running_results)
+                loss /= grad_accumulation_step
+                # Backpropagate and update the weights
+                scaler.scale(loss).backward()
+                if ((idx + 1) % grad_accumulation_step == 0) or (idx + 1 == len(relative_train_loader)):
+                    scaler.step(optimizer)
+                    scaler.update()
 
-                train_epoch_loss = float(
-                    train_running_results['accumulated_train_loss'] / train_running_results['images_in_epoch'])
-                experiment.log_metric('epoch_loss', train_epoch_loss, epoch=epoch)
+                update_train_running_results(train_running_results, loss, images_in_batch)
+                set_train_bar_description(train_bar, epoch, num_epochs, train_running_results)
 
-                # Training CSV logging
-                training_log_frame = pd.concat(
-                    [training_log_frame,
-                    pd.DataFrame(data={'epoch': epoch, 'train_epoch_loss': train_epoch_loss}, index=[0])])
-                training_log_frame.to_csv(str(training_path / 'train_metrics.csv'), index=False)
+            train_epoch_loss = float(
+                train_running_results['accumulated_train_loss'] / train_running_results['images_in_epoch'])
 
-                print(f"{training_path}")
+            # Training CSV logging
+            training_log_frame = pd.concat(
+                [training_log_frame,
+                pd.DataFrame(data={'epoch': epoch, 'train_epoch_loss': train_epoch_loss}, index=[0])])
+            training_log_frame.to_csv(str(training_path / 'train_metrics.csv'), index=False)
+
+            print(f"{training_path}")
 
         if epoch % validation_frequency == 0:
             print(f"[{datetime.now()}] Validating...")
             torch.cuda.empty_cache()
-            with experiment.validate():
-                with torch.no_grad():
-                    model.eval()
+            with torch.no_grad():
+                model.eval()
 
-                    if blip_img_tune or (not preprocess_val):
-                        relative_val_dataset = CIRRDataset('val', 'relative', preprocess)
-                        classic_val_dataset = CIRRDataset('val', 'classic', preprocess)
-                        val_index_features, val_index_features_p, val_index_names = extract_index_features(classic_val_dataset, model, blip_stage1=True)
-                        torch.cuda.empty_cache()
-
-                    # Compute and log validation metrics
-                    results = compute_cirr_val_metrics(relative_val_dataset, model, val_index_features, val_index_features_p,
-                                                    val_index_names)
-                    group_recall_at1, group_recall_at2, group_recall_at3, recall_at1, recall_at5, recall_at10, recall_at50 = results
-
-                    results_dict = {
-                        'group_recall_at1': group_recall_at1,
-                        'group_recall_at2': group_recall_at2,
-                        'group_recall_at3': group_recall_at3,
-                        'recall_at1': recall_at1,
-                        'recall_at5': recall_at5,
-                        'recall_at10': recall_at10,
-                        'recall_at50': recall_at50,
-                        'mean(R@5+R_s@1)': (group_recall_at1 + recall_at5) / 2,
-                        'arithmetic_mean': mean(results),
-                        'harmonic_mean': harmonic_mean(results),
-                        'geometric_mean': geometric_mean(results)
-                    }
-
-                    print(json.dumps(results_dict, indent=4))
-                    experiment.log_metrics(
-                        results_dict,
-                        epoch=epoch
-                    )
-
-                    # Validation CSV logging
-                    log_dict = {'epoch': epoch}
-                    log_dict.update(results_dict)
-                    validation_log_frame = pd.concat([validation_log_frame, pd.DataFrame(data=log_dict, index=[0])])
-                    validation_log_frame.to_csv(str(training_path / 'validation_metrics.csv'), index=False)
-
-                if not preprocess_val: # manually free up VRAM
-                    del val_index_features
-                    del val_index_features_p
+                if blip_img_tune or (not preprocess_val):
+                    relative_val_dataset = CIRRDataset('val', 'relative', preprocess)
+                    classic_val_dataset = CIRRDataset('val', 'classic', preprocess)
+                    val_index_features, val_index_features_p, val_index_names = extract_index_features(classic_val_dataset, model, blip_stage1=True)
                     torch.cuda.empty_cache()
 
-                # Save model
-                if save_training and train: # don't save ckpt if only validating
-                    save_model('blip_last', epoch, model, training_path, optimizer)
-                    if save_best and results_dict['mean(R@5+R_s@1)'] > best_mean:
-                        best_mean = results_dict['mean(R@5+R_s@1)']
-                        save_model('blip_mean', epoch, model, training_path, optimizer)
-                    if not save_best:
-                        save_model(f'blip_{epoch}', epoch, model, training_path, optimizer)
+                # Compute and log validation metrics
+                results = compute_cirr_val_metrics(relative_val_dataset, model, val_index_features, val_index_features_p,
+                                                val_index_names)
+                group_recall_at1, group_recall_at2, group_recall_at3, recall_at1, recall_at5, recall_at10, recall_at50 = results
 
-                    print(f"{training_path}/saved_models/blip_mean.pt")
+                results_dict = {
+                    'group_recall_at1': group_recall_at1,
+                    'group_recall_at2': group_recall_at2,
+                    'group_recall_at3': group_recall_at3,
+                    'recall_at1': recall_at1,
+                    'recall_at5': recall_at5,
+                    'recall_at10': recall_at10,
+                    'recall_at50': recall_at50,
+                    'mean(R@5+R_s@1)': (group_recall_at1 + recall_at5) / 2,
+                    'arithmetic_mean': mean(results),
+                    'harmonic_mean': harmonic_mean(results),
+                    'geometric_mean': geometric_mean(results)
+                }
+
+                print(json.dumps(results_dict, indent=4))
+
+                # Validation CSV logging
+                log_dict = {'epoch': epoch}
+                log_dict.update(results_dict)
+                validation_log_frame = pd.concat([validation_log_frame, pd.DataFrame(data=log_dict, index=[0])])
+                validation_log_frame.to_csv(str(training_path / 'validation_metrics.csv'), index=False)
+
+            if not preprocess_val: # manually free up VRAM
+                del val_index_features
+                del val_index_features_p
+                torch.cuda.empty_cache()
+
+            # Save model
+            if save_training and train: # don't save ckpt if only validating
+                save_model('blip_last', epoch, model, training_path, optimizer)
+                if save_best and results_dict['mean(R@5+R_s@1)'] > best_mean:
+                    best_mean = results_dict['mean(R@5+R_s@1)']
+                    save_model('blip_mean', epoch, model, training_path, optimizer)
+                    publish_cvs_stage(training_path, 'blip_mean', 1)
+                if not save_best:
+                    save_model(f'blip_{epoch}', epoch, model, training_path, optimizer)
+
+                print(f"{training_path}/saved_models/blip_mean.pt")
 
             if not train:
                 exit()
 
 if __name__ == '__main__':
     parser = ArgumentParser()
-    parser.add_argument("--train", dest="train", action='store_true', help="whether to do train")
+    parser.add_argument("--train", dest="train", action='store_true', default=True, help="whether to do train")
     parser.add_argument("--grad-accumulation-step", default=1, type=int, help="grad accu")
     parser.add_argument("--preprocess-val", dest="preprocess_val", action='store_true', help="whether to preprocess val features, which will occupy around 32G of VRAM on fiq -- we do not advise using this function unless you are sure your VRAM is sufficiently large")
 
     parser.add_argument("--dataset", type=str, required=True, help="should be either 'CIRR' or 'fashionIQ'")
-    parser.add_argument("--num_workers", type=int, required=False, default=4, help="For low memory consumption: limit cirr to 4 and fashioniq to 1 or 2. For optimal training efficiency, set to 8")
-    parser.add_argument("--api-key", type=str, help="api for Comet logging")
-    parser.add_argument("--workspace", type=str, help="workspace of Comet logging")
-    parser.add_argument("--experiment-name", type=str, help="name of the experiment on Comet")
+    parser.add_argument("--num_workers", type=int, default=None, help="For low memory consumption: limit cirr to 4 and fashioniq to 1 or 2. For optimal training efficiency, set to 8")
+    parser.add_argument("--experiment-name", type=str, help="run name used for the local log file")
 
     parser.add_argument("--num-epochs", default=20, type=int, help="number training epochs")
 
@@ -523,21 +498,23 @@ if __name__ == '__main__':
     parser.add_argument("--blip-max-epoch", default=20, type=int, help="BLIP max epoch")
     parser.add_argument("--blip-img-tune", dest="blip_img_tune", action='store_true', help="BLIP finetune image encoder, we do not finetune it in this work but preserve this option in code")
 
-    parser.add_argument("--batch-size", default=1024, type=int, help="Batch size of the stageI training")
+    parser.add_argument("--batch-size", default=512, type=int, help="Batch size of the stageI training")
     parser.add_argument("--blip-bs", default=32, type=int, help="Batch size during BLIP image feature extraction")
 
-    parser.add_argument("--validation-frequency", default=3, type=int, help="Validation frequency expressed in epochs")
+    parser.add_argument("--validation-frequency", default=1, type=int, help="Validation frequency expressed in epochs")
     parser.add_argument("--target-ratio", default=1.25, type=float, help="TargetPad target ratio")
     parser.add_argument("--transform", default="targetpad", type=str,
                         help="Preprocess pipeline, should be in ['squarepad', 'targetpad'] ")
-    parser.add_argument("--save-training", dest="save_training", action='store_true',
+    parser.add_argument("--save-training", dest="save_training", action='store_true', default=True,
                         help="Whether save the training model")
-    parser.add_argument("--save-best", dest="save_best", action='store_true',
+    parser.add_argument("--save-best", dest="save_best", action='store_true', default=True,
                         help="Save only the best model during training")
 
     args = parser.parse_args()
     if args.dataset.lower() not in ['fashioniq', 'cirr']:
         raise ValueError("Dataset should be either 'CIRR' or 'FashionIQ")
+    if args.num_workers is None:
+        args.num_workers = 2 if args.dataset.lower() == 'fashioniq' else 4
 
     training_hyper_params = {
         "num_epochs": args.num_epochs,
@@ -557,28 +534,6 @@ if __name__ == '__main__':
         "grad_accumulation_step": args.grad_accumulation_step,
         "preprocess_val": args.preprocess_val,
     }
-
-    if args.api_key and args.workspace:
-        print("Comet logging ENABLED")
-        experiment = Experiment(
-            api_key=args.api_key,
-            project_name=f"Candidate Rerank {args.dataset}",
-            workspace=args.workspace,
-            disabled=False
-        )
-        if args.experiment_name:
-            experiment.set_name(args.experiment_name)
-    else:
-        print("Comet loging DISABLED, in order to enable it you need to provide an api key and a workspace")
-        experiment = Experiment(
-            api_key="",
-            project_name="",
-            workspace="",
-            disabled=True
-        )
-
-    experiment.log_code(folder=str(_CR_PKG / "src"))
-    experiment.log_parameters(training_hyper_params)
 
     random_seed = 0
     print(f"setting random seed to {random_seed}")

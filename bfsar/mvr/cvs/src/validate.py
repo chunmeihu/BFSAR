@@ -27,7 +27,7 @@ import time
 from rich import print
 
 from data_utils import squarepad_transform, FashionIQDataset, targetpad_transform, CIRRDataset
-from utils import extract_index_features, collate_fn, device, get_model_path
+from utils import extract_index_features, collate_fn, device, get_model_path, publish_topk
 
 
 def compute_fiq_val_metrics(relative_val_dataset: FashionIQDataset,
@@ -80,7 +80,6 @@ def compute_fiq_val_metrics(relative_val_dataset: FashionIQDataset,
     if 'SAVE_TOPK' in globals():
         if SAVE_TOPK:
             print(f"{relative_val_dataset.dress_types} {relative_val_dataset.split} \nat50: {recall_at50} \nat60: {recall_at60} \nat70: {recall_at70} \nat80: {recall_at80} \nat90: {recall_at90} \nat100: {recall_at100} \nat150: {recall_at150} \nat200: {recall_at200} \nat300: {recall_at300} \nat400: {recall_at400} \nat500: {recall_at500}")
-            breakpoint() # confirm saving to file
 
             dress_types = ','.join(relative_val_dataset.dress_types) # dset.triplets are fixed, directly loaded from json file. should be fine.
             save_dir = os.path.dirname(os.path.dirname(STAGE1_PATH)) + f'/fiq_top_{K_VALUE}_{relative_val_dataset.split}_{dress_types}.pt'
@@ -92,6 +91,7 @@ def compute_fiq_val_metrics(relative_val_dataset: FashionIQDataset,
                 'split': relative_val_dataset.split,
                 'dress_types': dress_types,
             }, save_dir)
+            publish_topk(save_dir)
             print(f"top {K_VALUE} saved at {save_dir}.")
     else: # SAVE_TOPK not defined if in training
         pass
@@ -249,7 +249,6 @@ def compute_cirr_val_metrics(relative_val_dataset: CIRRDataset,
     if 'SAVE_TOPK' in globals():
         if SAVE_TOPK:
             print(f"{relative_val_dataset.split} \nat50: {recall_at50} \nat60: {recall_at60} \nat70: {recall_at70} \nat80: {recall_at80} \nat90: {recall_at90} \nat100: {recall_at100} \nat150: {recall_at150} \nat200: {recall_at200} \nat300: {recall_at300} \nat400: {recall_at400} \nat500: {recall_at500}")
-            breakpoint() # confirm saving to file
 
             save_dir = os.path.dirname(os.path.dirname(STAGE1_PATH)) + f'/cirr_top_{K_VALUE}_{relative_val_dataset.split}.pt'
             # by default save to the experiment folder
@@ -261,6 +260,7 @@ def compute_cirr_val_metrics(relative_val_dataset: CIRRDataset,
                 'group_labels': group_labels,
                 'split': relative_val_dataset.split,
             }, save_dir)
+            publish_topk(save_dir)
             print(f"top {K_VALUE} saved at {save_dir}.")
     else: # SAVE_TOPK not defined if in training
         pass
@@ -342,7 +342,7 @@ def cirr_val_retrieval(model: torch.nn.Module, preprocess: callable, train=False
 def main():
     parser = ArgumentParser()
     parser.add_argument("--dataset", type=str, required=True, help="should be either 'CIRR' or 'fashionIQ'")
-    parser.add_argument("--stage1-path", type=str, help="path to trained Stage1")
+    parser.add_argument("--stage1-path", type=str, default=None, help="path to trained Stage1")
 
     parser.add_argument("--target-ratio", default=1.25, type=float, help="TargetPad target ratio")
     parser.add_argument("--transform", default="targetpad", type=str,
@@ -351,11 +351,18 @@ def main():
     parser.add_argument("--train", dest="train", action='store_true',
                         help="Whether to validate on train-split")
     
-    parser.add_argument("--save-topk", dest="save_topk", action='store_true',
+    parser.add_argument("--save-topk", dest="save_topk", action='store_true', default=True,
                         help="Whether to save the topK results")
     parser.add_argument("--k", default=200, type=int,
-                        help="top-k value to be saved. For Fashion-IQ: default 100; for CIRR: default 50.")
+                        help="top-k value to be saved")
     args = parser.parse_args()
+    if args.dataset.lower() not in ['fashioniq', 'cirr']:
+        raise ValueError("Dataset should be either 'CIRR' or 'FashionIQ")
+    if not args.stage1_path:
+        args.stage1_path = (
+            "models/stage1/fashionIQ" if args.dataset.lower() == "fashioniq"
+            else "models/stage1/CIRR"
+        )
 
     args.stage1_path = get_model_path(args.stage1_path, args.dataset.lower())
 
@@ -373,7 +380,7 @@ def main():
     if args.transform == 'targetpad':
         print('Target pad preprocess pipeline is used')
         preprocess = targetpad_transform(args.target_ratio, input_dim)
-    elif args.preprocess == 'squarepad':
+    elif args.transform == 'squarepad':
         print('Square pad preprocess pipeline is used')
         preprocess = squarepad_transform(input_dim)
     else:

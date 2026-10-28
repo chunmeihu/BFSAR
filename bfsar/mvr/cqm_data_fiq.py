@@ -187,4 +187,4 @@ def load_fiq_val_queries(category: str) -> Tuple[List[str], List[str], List[str]
 
 def default_topk_pt(category: str) -> Path:
     root = Path(__file__).resolve().parents[2]
-    return root / "output" / "fiq_vision_desc" / f"hbi_top200_val_{category}.pt"
+    return root / "output" / "cqm" / "fashioniq" / f"coarse_top200_val_{category}.pt"

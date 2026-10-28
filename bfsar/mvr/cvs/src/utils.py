@@ -1,4 +1,5 @@
 import os
+import shutil
 import multiprocessing
 import random
 from pathlib import Path
@@ -131,6 +132,46 @@ def set_train_bar_description(train_bar, epoch: int, num_epochs: int, train_runn
         desc=f"[{epoch}/{num_epochs}] "
              f"train loss: {train_running_results['accumulated_train_loss'] / train_running_results['images_in_epoch']:.3f} "
     )
+
+
+def publish_checkpoint(src, dest) -> str:
+    src = os.path.abspath(src)
+    dest = os.path.abspath(dest)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.islink(dest):
+        os.remove(dest)
+    if src != dest:
+        shutil.copy2(src, dest)
+    print(f"published {dest}")
+    return dest
+
+
+_REPO = Path(__file__).resolve().parents[4]
+_CVS = Path(__file__).resolve().parents[1]
+
+
+def publish_cvs_stage(training_path, name: str, stage: int) -> None:
+    src = Path(training_path) / "saved_models" / f"{name}.pt"
+    if name == "blip_mean":
+        dataset, folder = "cirr", "CIRR"
+    elif name == "blip":
+        dataset, folder = "fashioniq", "fashionIQ"
+    else:
+        return
+    publish_checkpoint(src, _REPO / "weights" / "cvs" / dataset / f"stage{stage}.pt")
+    if stage == 1:
+        publish_checkpoint(src, _CVS / "models" / "stage1" / folder / "saved_models" / f"{name}.pt")
+
+
+def publish_topk(save_dir) -> None:
+    name = os.path.basename(save_dir)
+    if name.startswith("cirr_"):
+        dest = _REPO / "weights" / "cvs" / "cirr" / name
+    elif name.startswith("fiq_"):
+        dest = _REPO / "weights" / "cvs" / "fashioniq" / name
+    else:
+        return
+    publish_checkpoint(save_dir, dest)
 
 
 def save_model(name: str, cur_epoch: int, model_to_save: nn.Module, training_path: Path, optimizer):

@@ -16,7 +16,6 @@ from bfsar.models.tokenization_clip import SimpleTokenizer as ClipTokenizer
 from bfsar.cirr.modeling_bm import BMEstimator
 from bfsar.cirr.optimization_bertadam import BertAdam
 from bfsar.cirr.cirr_dataloader_builders import build_cirr_train_dataloader
-from bfsar.cirr import cirr_paths
 from bfsar.utils.comm import is_main_process, synchronize
 from bfsar.utils.logger import setup_logger
 from bfsar.utils.metric_logger import MetricLogger
@@ -28,7 +27,7 @@ def get_args():
     parser = argparse.ArgumentParser(
         description="CIRR Banzhaf estimator (BFSAR Stage 1, no MSRVTT warm-start)")
     parser.add_argument("--do_train", type=int, default=1)
-    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default="output/bm/cirr")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-2,
@@ -49,7 +48,11 @@ def get_args():
                         help="Auto-enabled when launched via torchrun")
     parser.add_argument("--n_display", type=int, default=50)
     parser.add_argument("--base_encoder", type=str, default="ViT-L/14")
-    parser.add_argument("--clip_checkpoint", type=str, default=cirr_paths.CLIP_VITL14_CHECKPOINT)
+    parser.add_argument(
+        "--clip_checkpoint",
+        type=str,
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights", "openclip", "ViT-L-14-laion2B-s32B-b82K.pt"),
+    )
     parser.add_argument("--agg_module", type=str, default="None", choices=["None", "seqLSTM", "seqTransf"])
     parser.add_argument("--interaction", type=str, default="fgsa")
     parser.add_argument("--num_hidden_layers", type=int, default=4)
@@ -137,7 +140,9 @@ def save_estimator(epoch, args, model):
     inner = model.module if hasattr(model, "module") else model
     path = join(args.output_dir, f"banzhaf_estimator.epoch{epoch}.pt")
     torch.save(inner.banzhafteacher.state_dict(), path)
-    logger.info("Saved estimator to %s", path)
+    from bfsar.checkpoint_io import publish_checkpoint
+    published = publish_checkpoint(path, join(os.path.dirname(os.path.abspath(__file__)), "weights", "bm", "cirr", "banzhaf_module.pt"))
+    logger.info("Saved estimator to %s and %s", path, published)
     return path
 
 

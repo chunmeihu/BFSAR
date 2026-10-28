@@ -25,23 +25,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bfsar.cirr.metrics import rank_by_similarity
-from bfsar.cirr.modeling_fgsa import FGSAModel
 from bfsar.mvr.cvs_infer import load_blip_models, merge_rerank_with_coarse_gallery
-from bfsar.mvr.cqm_model import build_blip2_qtr, load_blip2_qtr_ckpt
+from bfsar.mvr.cqm_model import DEFAULT_ITM_ID, build_blip2_qtr, load_blip2_qtr_ckpt
 from bfsar.fiq import fiq_paths
 from bfsar.mvr.cvs_fiq import (
-    align_to_official,
     build_topk_payload,
-    encode_hbi_fused,
     recall_at_ks,
     rerank_category as cr_rerank_category,
 )
 from bfsar.mvr.cqm_data_fiq import fiq_targetpad_preprocess
 from bfsar.mvr.cqm_rerank_fiq import rerank_category as qtr_rerank_category
-from bfsar.models.tokenization_clip import SimpleTokenizer as ClipTokenizer
 from bfsar.rerank.paths import COMPOSER_FIQ_DEFAULT, DEFAULT_FIQ_STAGE1, DEFAULT_FIQ_STAGE2
 
-logger = logging.getLogger("fiq_hbi_cqm_cr_fusion")
+logger = logging.getLogger("bfsar_fuse_fiq")
 
 DEFAULT_FGSA_CKPT = str(ROOT / "weights/fgsa/fashioniq/pytorch_model.bin")
 DEFAULT_DUAL = str(ROOT / "data/fashioniq/vision_desc/val_dual_targets.json")
@@ -85,39 +81,58 @@ def pool_from_scores(scores: np.ndarray, labels: np.ndarray, ks=(10, 50, 100, 30
 
 
 def _topk_pt(out_dir: Path, cat: str, k_save: int, split: str = "val") -> Path:
-    return out_dir / f"hbi_top{k_save}_{split}_{cat}.pt"
+    return out_dir / f"coarse_top{k_save}_{split}_{cat}.pt"
 
 
 def _coarse_npz(out_dir: Path, cat: str) -> Path:
-    return out_dir / f"hbi_fused_{cat}.npz"
+    return out_dir / f"coarse_fused_{cat}.npz"
 
 
 def _score_npz(out_dir: Path, tag: str, cat: str) -> Path:
     return out_dir / f"{tag}_{cat}.npz"
 
 
+def _dual_from_dpic_npz(path: Path) -> Dict[str, Any]:
+    """Same dual score as eval_dpic_fiq: both paths (α, β) = (0.4, 0.2), w = 0.5."""
+    from bfsar.dpic.calibrate import fuse_paths, score_path
+    from bfsar.dpic.norm import zscore_rows as zrows
+
+    raw = np.load(path, allow_pickle=True)
+    rasd = score_path(zrows(raw["modified"]), zrows(raw["relative"]), zrows(raw["ref"]), 0.4, 0.2)
+    dasd = score_path(zrows(raw["modified"]), zrows(raw["relative"]), zrows(raw["vision"]), 0.4, 0.2)
+    dual = fuse_paths(rasd, dasd, 0.5)
+    return {
+        "sim": np.asarray(dual, dtype=np.float32),
+        "index_names": [str(x) for x in raw["index_names"].tolist()],
+        "refs": [str(x) for x in raw["refs"].tolist()],
+        "tgts": [str(x) for x in raw["tgts"].tolist()],
+    }
+
+
 def dump_coarse(args, cats: Sequence[str], device) -> None:
     out_dir = Path(args.out_dir)
     split = getattr(args, "split", "val")
-    tokenizer = ClipTokenizer()
-    model = FGSAModel(args)
-    state = torch.load(args.init_model, map_location="cpu")
-    if isinstance(state, dict) and "model_state_dict" in state:
-        state = state["model_state_dict"]
-    cleaned = {(k[7:] if k.startswith("module.") else k): v for k, v in state.items()}
-    missing, unexpected = model.load_state_dict(cleaned, strict=False)
-    logger.info("Loaded FIQ BFSAR %s missing=%d unexpected=%d", args.init_model, len(missing), len(unexpected))
-    model = model.to(device).eval()
+    dpic_root = Path(getattr(args, "dpic_dir", None) or (ROOT / "output" / "dpic" / "fashioniq" / split))
     for cat in cats:
-        hbi = encode_hbi_fused(model, args, tokenizer, cat, device)
+        src = dpic_root / f"scores_{cat}.npz"
+        if not src.is_file():
+            raise FileNotFoundError(
+                f"Missing coarse scores: {src}\n"
+                f"Run the coarse step first: bash scripts/eval_dpic_fiq.sh --split {split}"
+            )
+        logger.info("FIQ coarse %s from %s", cat, src)
+        coarse = _dual_from_dpic_npz(src)
         np.savez_compressed(
             _coarse_npz(out_dir, cat),
-            sim=hbi["sim"],
-            index_names=np.array(hbi["index_names"], dtype=object),
-            refs=np.array(hbi["refs"], dtype=object),
-            tgts=np.array(hbi["tgts"], dtype=object),
+            sim=coarse["sim"],
+            index_names=np.array(coarse["index_names"], dtype=object),
+            refs=np.array(coarse["refs"], dtype=object),
+            tgts=np.array(coarse["tgts"], dtype=object),
         )
-        sim, index_names, refs, tgts = align_to_official(hbi, cat, split=split)
+        sim = coarse["sim"]
+        index_names = coarse["index_names"]
+        refs = coarse["refs"]
+        tgts = coarse["tgts"]
         ranked = rank_by_similarity(sim, index_names)
         if split != "test":
             coarse = recall_at_ks(ranked, refs, tgts, ks=(10, 50, 100, 200, 300))
@@ -132,13 +147,8 @@ def dump_coarse(args, cats: Sequence[str], device) -> None:
         payload = build_topk_payload(
             sim, index_names, refs, tgts, cat, int(args.k_save), split=split,
         )
-        payload["source"] = "hbi_12crop_fiqbest_0.3_0.4_0.3_mu0"
-        payload["weights"] = {
-            "w_vision": args.w_vision,
-            "w_modified": args.w_modified,
-            "w_relative": args.w_relative,
-            "mu": args.mu,
-        }
+        payload["source"] = "dpic_dual_0.4_0.2_w0.5"
+        payload["weights"] = {"alpha": 0.4, "beta": 0.2, "w": 0.5}
         pt = _topk_pt(out_dir, cat, int(args.k_save), split=split)
         torch.save(payload, pt)
         meta = {
@@ -149,8 +159,6 @@ def dump_coarse(args, cats: Sequence[str], device) -> None:
             "split": split,
         }
         (out_dir / f"coarse_{cat}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    del model
-    _free_cuda()
 
 
 def _parse_cqm_ckpt_by_cat(raw: str | None) -> Dict[str, str]:
@@ -202,7 +210,7 @@ def score_cqm(args, cats: Sequence[str], device) -> None:
         model = build_blip2_qtr(
             device,
             pretrained_id=args.pretrained_id,
-            local_files_only=True,
+            local_files_only=False,
             freeze_vision=True,
             stage="a",
         )
@@ -295,7 +303,7 @@ def _load_score(path: Path) -> Dict[str, Any]:
     }
 
 
-def _hbi_pool_scores(out_dir: Path, cat: str, k_sorted: np.ndarray, refs: List[str], tgts: List[str]):
+def _coarse_pool_scores(out_dir: Path, cat: str, k_sorted: np.ndarray, refs: List[str], tgts: List[str]):
     """Gather coarse scores for the Top-K names, aligned to score-file query order.
 
     Score dumps (CQM/CR) may use compose-feat order / a subset of official val;
@@ -304,13 +312,13 @@ def _hbi_pool_scores(out_dir: Path, cat: str, k_sorted: np.ndarray, refs: List[s
     raw = np.load(_coarse_npz(out_dir, cat), allow_pickle=True)
     sim_all = np.asarray(raw["sim"], dtype=np.float32)
     index_names = [str(x) for x in raw["index_names"].tolist()]
-    hbi_refs = [str(x) for x in raw["refs"].tolist()]
-    hbi_tgts = [str(x) for x in raw["tgts"].tolist()]
-    key_to_i = {(r, t): i for i, (r, t) in enumerate(zip(hbi_refs, hbi_tgts))}
+    coarse_refs = [str(x) for x in raw["refs"].tolist()]
+    coarse_tgts = [str(x) for x in raw["tgts"].tolist()]
+    key_to_i = {(r, t): i for i, (r, t) in enumerate(zip(coarse_refs, coarse_tgts))}
     try:
         row_idx = [key_to_i[(r, t)] for r, t in zip(refs, tgts)]
     except KeyError as e:
-        raise RuntimeError(f"{cat}: score-file query missing from hbi_fused: {e}") from e
+        raise RuntimeError(f"{cat}: score-file query missing from coarse scores: {e}") from e
     sim = sim_all[row_idx]
     name_to_j = {str(n): i for i, n in enumerate(index_names)}
     n, k = k_sorted.shape
@@ -404,7 +412,7 @@ def fuse_test_submit(args, cats: Sequence[str]) -> Dict[str, Any]:
     for cat in cats:
         comp = _load_score(_score_npz(out_dir, "cqm", cat))
         cr = _load_score(_score_npz(out_dir, "cr", cat))
-        s_scrs, sim, index_names, refs, tgts = _hbi_pool_scores(
+        s_scrs, sim, index_names, refs, tgts = _coarse_pool_scores(
             out_dir, cat, comp["k_sorted"], comp["reference_names"], comp["target_names"],
         )
         h = zscore_rows(s_scrs)
@@ -455,7 +463,7 @@ def fuse_all(args, cats: Sequence[str]) -> Dict[str, Any]:
             raise RuntimeError(f"{cat}: cqm/CR query order mismatch")
         if not np.array_equal(comp["k_sorted"].astype(str), cr["k_sorted"].astype(str)):
             raise RuntimeError(f"{cat}: cqm/CR top-k order mismatch")
-        s_scrs, sim, index_names, refs, tgts = _hbi_pool_scores(
+        s_scrs, sim, index_names, refs, tgts = _coarse_pool_scores(
             out_dir, cat, comp["k_sorted"], comp["reference_names"], comp["target_names"],
         )
         labels = comp["labels"]
@@ -531,7 +539,7 @@ def fuse_all(args, cats: Sequence[str]) -> Dict[str, Any]:
         }
         logger.info(
             "FIQ %s full R@10/50 | coarse=%.2f/%.2f cqm=%.2f/%.2f CR=%.2f/%.2f "
-            "frozen0.25/0.30/0.45=%.2f/%.2f grid-best=%.2f/%.2f (a=%.2f b=%.2f g=%.2f)",
+            "frozen=%.2f/%.2f grid-best=%.2f/%.2f (a=%.2f b=%.2f g=%.2f)",
             cat,
             singles_full["coarse"]["recall_at10"], singles_full["coarse"]["recall_at50"],
             singles_full["cqm"]["recall_at10"], singles_full["cqm"]["recall_at50"],
@@ -578,6 +586,8 @@ def fuse_all(args, cats: Sequence[str]) -> Dict[str, Any]:
         mean["fused_0.15_0.40_0.45"]["recall_at50"],
     )
     report = {
+        "split": "val",
+        "gallery": "Original-Split",
         "k_save": int(args.k_save),
         "k_rerank": int(args.k_rerank),
         "coarse_weights": {
@@ -601,6 +611,123 @@ def fuse_all(args, cats: Sequence[str]) -> Dict[str, Any]:
     return report
 
 
+def _mcot_gallery(refs: Sequence[str], tgts: Sequence[str]) -> List[str]:
+    seen = set()
+    gallery = []
+    for ref, tgt in zip(refs, tgts):
+        for name in (str(ref), str(tgt)):
+            if name and name not in seen:
+                seen.add(name)
+                gallery.append(name)
+    return gallery
+
+
+def _metrics_nodrop(scores, k_sorted, sim, index_names, refs, tgts) -> Dict[str, float]:
+    """MCoT small-gallery protocol: the reference stays in the ranking."""
+    order = np.argsort(-np.asarray(scores), axis=1)
+    head = np.take_along_axis(np.asarray(k_sorted, dtype=object), order, axis=1)
+    coarse = rank_by_similarity(sim, index_names)
+    ranks = np.empty(len(refs), dtype=np.int64)
+    for i in range(len(refs)):
+        seen = set()
+        ranking = []
+        for name in list(head[i]) + list(coarse[i]):
+            text = str(name)
+            if text in seen:
+                continue
+            seen.add(text)
+            ranking.append(text)
+        try:
+            ranks[i] = ranking.index(str(tgts[i]))
+        except ValueError:
+            ranks[i] = len(ranking)
+    return {f"recall_at{k}": float(np.mean(ranks < k) * 100.0) for k in (10, 50, 100, 200, 300)}
+
+
+def run_small_gallery(args, cats: Sequence[str], device) -> None:
+    """VAL-Split: unique reference ∪ target, then the same K=200 fusion."""
+    import copy
+
+    from bfsar.dpic.calibrate import fuse_paths, score_path
+    from bfsar.dpic.norm import zscore_rows as zrows
+
+    parent = Path(args.out_dir)
+    small_dir = parent / "small"
+    small_dir.mkdir(parents=True, exist_ok=True)
+    dpic_root = Path(getattr(args, "dpic_dir", None) or (ROOT / "output" / "dpic" / "fashioniq" / "val"))
+    for cat in cats:
+        src = dpic_root / f"scores_{cat}.npz"
+        if not src.is_file():
+            raise FileNotFoundError(src)
+        raw = np.load(src, allow_pickle=True)
+        names = [str(x) for x in raw["index_names"].tolist()]
+        refs = [str(x) for x in raw["refs"].tolist()]
+        tgts = [str(x) for x in raw["tgts"].tolist()]
+        modified = np.asarray(raw["modified"], dtype=np.float32)
+        relative = np.asarray(raw["relative"], dtype=np.float32)
+        reference = np.asarray(raw["ref"], dtype=np.float32)
+        vision = np.asarray(raw["vision"], dtype=np.float32)
+        gallery = _mcot_gallery(refs, tgts)
+        col = {name: i for i, name in enumerate(names)}
+        cols = [col[name] for name in gallery]
+        rasd = score_path(zrows(modified[:, cols]), zrows(relative[:, cols]), zrows(reference[:, cols]), 0.4, 0.2)
+        dasd = score_path(zrows(modified[:, cols]), zrows(relative[:, cols]), zrows(vision[:, cols]), 0.4, 0.2)
+        dual = np.asarray(fuse_paths(rasd, dasd, 0.5), dtype=np.float32)
+        np.savez_compressed(
+            _coarse_npz(small_dir, cat),
+            sim=dual,
+            index_names=np.array(gallery, dtype=object),
+            refs=np.array(refs, dtype=object),
+            tgts=np.array(tgts, dtype=object),
+        )
+        payload = build_topk_payload(dual, gallery, refs, tgts, cat, int(args.k_save), split="val")
+        torch.save(payload, _topk_pt(small_dir, cat, int(args.k_save), split="val"))
+        logger.info("FIQ small gallery %s queries=%d gallery=%d", cat, len(refs), len(gallery))
+
+    small_args = copy.copy(args)
+    small_args.out_dir = str(small_dir)
+    score_cqm(small_args, cats, device)
+    score_cr(small_args, cats, device)
+    a, b, g = FROZEN
+    per = {}
+    for cat in cats:
+        comp = _load_score(_score_npz(small_dir, "cqm", cat))
+        cr = _load_score(_score_npz(small_dir, "cr", cat))
+        s_scrs, sim, index_names, refs, tgts = _coarse_pool_scores(
+            small_dir, cat, comp["k_sorted"], comp["reference_names"], comp["target_names"],
+        )
+        fused = a * zscore_rows(s_scrs) + b * zscore_rows(comp["pred_logits"]) + g * zscore_rows(cr["pred_logits"])
+        per[cat] = {
+            "n_queries": len(refs),
+            "n_gallery": len(index_names),
+            **_metrics_nodrop(fused, comp["k_sorted"], sim, index_names, refs, tgts),
+        }
+    mean = {
+        key: float(np.mean([per[cat][key] for cat in cats]))
+        for key in per[cats[0]]
+        if key.startswith("recall")
+    }
+    report_path = parent / "fusion_metrics.json"
+    report = json.loads(report_path.read_text(encoding="utf-8")) if report_path.is_file() else {}
+    report["large_original_split"] = {
+        "protocol": "drop-ref",
+        "gallery": "Original-Split split.{cat}.val.json",
+        "mean": report.get("mean"),
+        "per_category": report.get("per_category"),
+    }
+    report["small_val_split"] = {
+        "protocol": "MCoT no-drop",
+        "gallery": "VAL-Split unique ref∪tgt",
+        "mean": mean,
+        "per": per,
+    }
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    logger.info(
+        "FIQ small gallery mean R@10/50=%.2f/%.2f",
+        mean["recall_at10"], mean["recall_at50"],
+    )
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="FIQ 12-crop best coarse + CQM + CR, K=300")
     p.add_argument("--only", choices=["coarse", "cqm", "cr", "fuse", "all"], default="all")
@@ -616,7 +743,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stage1_ckpt", type=str, default=DEFAULT_STAGE1)
     p.add_argument("--stage2_ckpt", type=str, default=DEFAULT_STAGE2)
     p.add_argument("--out_dir", type=str, default=DEFAULT_OUT)
-    p.add_argument("--pretrained_id", type=str, default="Salesforce/blip2-itm-vit-g")
+    p.add_argument("--pretrained_id", type=str, default=DEFAULT_ITM_ID)
     p.add_argument("--fiq_categories", type=str, default="dress,shirt,toptee")
     p.add_argument("--split", type=str, default="val", choices=["val", "test"])
     p.add_argument(
@@ -694,6 +821,8 @@ def main() -> None:
         if args.only == "cr":
             return
     fuse_all(args, cats)
+    if args.split == "val" and args.only == "all":
+        run_small_gallery(args, cats, device)
 
 
 if __name__ == "__main__":

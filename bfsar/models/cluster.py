@@ -780,25 +780,3 @@ class TCBlock(nn.Module):
         q_dict['x'] = x
 
         return q_dict
-
-
-if __name__ == '__main__':
-    ctm = CTM(sample_ratio=0.5, embed_dim=512, dim_out=1024, k=3)
-    block = TCBlock(dim=1024, num_heads=8)
-    x = torch.randn((2, 12, 512))
-    idx_token = torch.arange(12)[None, :].repeat(2, 1)
-    agg_weight = x.new_ones(2, 12, 1)
-    mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0], [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0]])
-    token_dict = {'x': x,
-                  'token_num': 12,
-                  'idx_token': idx_token,
-                  'agg_weight': agg_weight,
-                  'mask': mask}
-    print(x.size())
-    down_dict = ctm(token_dict)
-    q_dict = block(down_dict)
-    ctm1 = CTM(sample_ratio=0.125, embed_dim=1024, dim_out=2048, k=3)
-    block1 = TCBlock(dim=2048, num_heads=16)
-    down_dict = ctm1(q_dict)
-    q_dict = block1(down_dict)
-    print(q_dict["x"].size())

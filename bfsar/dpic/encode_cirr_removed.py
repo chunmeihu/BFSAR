@@ -28,7 +28,7 @@ from bfsar.cirr import cirr_paths
 from bfsar.cirr.cirr_dataloader_builders import build_cirr_gallery_dataloader
 from bfsar.cirr.eval_fgsa import encode_gallery, _similarity_matrix
 from bfsar.cirr.modeling_fgsa import FGSAModel
-from bfsar.cirr.vision_desc.eval_hbi_pos_neg import encode_neg_phrase_sim
+from bfsar.cirr.vision_desc.neg_phrase import encode_neg_phrase_sim
 from bfsar.dpic.encode_cirr import (
     CIRRTripleVisionDataset,
     collate_fn,
@@ -41,7 +41,7 @@ from bfsar.models.tokenization_clip import SimpleTokenizer as ClipTokenizer
 
 logger = logging.getLogger("triple_vision_removed")
 
-DEFAULT_CKPT = str(ROOT / "output" / "cirr_retrieval" / "pytorch_model.bin.best.10")
+DEFAULT_CKPT = str(ROOT / "weights" / "fgsa" / "cirr" / "pytorch_model.bin")
 DEFAULT_DESCS = str(ROOT / "data" / "cirr" / "vision_desc" / "val_dual_targets.json")
 DEFAULT_OUT = str(ROOT / "output" / "cirr_vision_desc" / "metrics_triple_vision_removed.json")
 

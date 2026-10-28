@@ -16,10 +16,11 @@ import torch.nn.functional as F
 from torch import nn
 
 from bfsar.mvr.cvs_infer import _prefer_offline_hf_bert
+from bfsar.rerank.paths import blip2_pretrained_id
 
 logger = logging.getLogger("blip2_qtr")
 
-DEFAULT_ITM_ID = "Salesforce/blip2-itm-vit-g"
+DEFAULT_ITM_ID = blip2_pretrained_id()
 VISION_INPUT_SIZE = 224
 ARCH_TAG = "qtr_v1c"  # v1c: freeze emb + CIRR group hard-negs on native ITM
 
@@ -431,6 +432,11 @@ def build_blip2_qtr(
 ) -> Blip2QTR:
     _prefer_offline_hf_bert()
     from transformers import Blip2ForImageTextRetrieval
+    from pathlib import Path
+
+    pretrained_id = blip2_pretrained_id(pretrained_id)
+    if Path(pretrained_id).is_dir():
+        local_files_only = True
 
     # FP32 master weights for GradScaler.
     full = Blip2ForImageTextRetrieval.from_pretrained(

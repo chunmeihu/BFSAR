@@ -1,7 +1,7 @@
 """Vendored Candidate-Reranking (CR) BLIP Stage-1/2.
 
 Upstream: https://github.com/Cuberick-Orion/Candidate-Reranking-CIR (MIT).
-Code under ``src/`` and ``configs/``; checkpoints under ``weights/cr/``.
+Code under ``src/`` and ``configs/``; checkpoints under ``weights/cvs/``.
 
 Load via ``bfsar.mvr.cvs_infer.load_blip_models``.
 """

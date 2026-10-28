@@ -35,7 +35,7 @@ from bfsar.models.tokenization_clip import SimpleTokenizer as ClipTokenizer
 
 logger = logging.getLogger("pos_neg_eval")
 
-DEFAULT_CKPT = str(ROOT / "output" / "cirr_retrieval" / "pytorch_model.bin.best.10")
+DEFAULT_CKPT = str(ROOT / "weights" / "fgsa" / "cirr" / "pytorch_model.bin")
 DEFAULT_POS_NEG = str(ROOT / "output" / "cirr_vision_desc" / "val_pos_neg.json")
 DEFAULT_OUT = str(ROOT / "output" / "cirr_vision_desc" / "metrics_pos_neg.json")
 

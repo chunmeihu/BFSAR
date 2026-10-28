@@ -12,7 +12,7 @@ from tqdm import tqdm
 from bfsar.cirr.eval_fgsa import _similarity_matrix, encode_gallery
 from bfsar.cirr.metrics import rank_by_similarity
 
-logger = logging.getLogger("fiq_hbi")
+logger = logging.getLogger("fgsa_fiq")
 
 
 @torch.no_grad()

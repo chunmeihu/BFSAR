@@ -8,6 +8,7 @@ __pycache__/
 *.npz
 *.log
 
+bfsar/mvr/cvs/models/
 data/cirr/img_raw/
 data/cirr/cirr_dataset/
 data/fashioniq/images/

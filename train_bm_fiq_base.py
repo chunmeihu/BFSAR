@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """Stage 1: train Banzhaf interaction estimator on Fashion-IQ (ViT-L/14, multi-crop CLS).
 
-Same recipe as CIRR Stage-1: freeze CLIP, supervise banzhafteacher with MC Banzhaf labels
-on (ModifiedImageCaption, target-image crops). All three FIQ categories are pooled.
-FIQ uses 6 garment crops, MC=100, max_words=77 (CIRR stays on 12-crop).
+Freeze CLIP and supervise the Banzhaf teacher with Monte Carlo labels on
+(ModifiedImageCaption, target-image crops). All three categories are pooled.
+The released run uses the 12-crop layout, 32 tokens, and 50 Monte Carlo samples.
 """
 
 from __future__ import absolute_import, division, print_function, unicode_literals
@@ -21,7 +21,6 @@ from bfsar.models.tokenization_clip import SimpleTokenizer as ClipTokenizer
 from bfsar.cirr.modeling_bm import BMEstimator
 from bfsar.cirr.optimization_bertadam import BertAdam
 from bfsar.fiq.fiq_dataloader_builders import build_fiq_train_dataloader
-from bfsar.fiq import fiq_paths
 from bfsar.utils.comm import is_main_process, synchronize
 from bfsar.utils.logger import setup_logger
 from bfsar.utils.metric_logger import MetricLogger
@@ -33,7 +32,7 @@ def get_args():
     parser = argparse.ArgumentParser(
         description="Fashion-IQ Banzhaf estimator (BFSAR Stage 1, no CIRR/MSRVTT warm-start)")
     parser.add_argument("--do_train", type=int, default=1)
-    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--output_dir", type=str, default="output/bm/fashioniq")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-2,
@@ -45,8 +44,8 @@ def get_args():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--grad_accum_steps", type=int, default=4,
                         help="Gradient accumulation; effective update batch = batch_size * grad_accum_steps")
-    parser.add_argument("--max_words", type=int, default=77)
-    parser.add_argument("--max_frames", type=int, default=6, help="Number of image crops (players); FIQ uses 6")
+    parser.add_argument("--max_words", type=int, default=32)
+    parser.add_argument("--max_frames", type=int, default=12, help="Number of image crops (players)")
     parser.add_argument("--image_resolution", type=int, default=224)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--local_rank", type=int, default=0)
@@ -54,12 +53,16 @@ def get_args():
                         help="Auto-enabled when launched via torchrun")
     parser.add_argument("--n_display", type=int, default=50)
     parser.add_argument("--base_encoder", type=str, default="ViT-L/14")
-    parser.add_argument("--clip_checkpoint", type=str, default=fiq_paths.CLIP_VITL14_CHECKPOINT)
+    parser.add_argument(
+        "--clip_checkpoint",
+        type=str,
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights", "openclip", "ViT-L-14-laion2B-s32B-b82K.pt"),
+    )
     parser.add_argument("--agg_module", type=str, default="None", choices=["None", "seqLSTM", "seqTransf"])
     parser.add_argument("--interaction", type=str, default="fgsa")
     parser.add_argument("--num_hidden_layers", type=int, default=4)
-    parser.add_argument("--banzhaf_mc_samples", type=int, default=100,
-                        help="Monte Carlo samples per token-crop pair (BFSAR default 100)")
+    parser.add_argument("--banzhaf_mc_samples", type=int, default=50,
+                        help="Monte Carlo samples per token-crop pair")
     parser.add_argument("--start_epoch", type=int, default=1,
                         help="1-based epoch to start/resume from; loads epoch{start_epoch-1}.pt when >1")
     parser.add_argument("--fiq_image_root", type=str, default=None)
@@ -148,7 +151,9 @@ def save_estimator(epoch, args, model):
     inner = model.module if hasattr(model, "module") else model
     path = join(args.output_dir, f"banzhaf_estimator.epoch{epoch}.pt")
     torch.save(inner.banzhafteacher.state_dict(), path)
-    logger.info("Saved estimator to %s", path)
+    from bfsar.checkpoint_io import publish_checkpoint
+    published = publish_checkpoint(path, join(os.path.dirname(os.path.abspath(__file__)), "weights", "bm", "fashioniq", "banzhaf_module.pt"))
+    logger.info("Saved estimator to %s and %s", path, published)
     return path
 
 

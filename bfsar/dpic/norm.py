@@ -45,7 +45,7 @@ from bfsar.models.tokenization_clip import SimpleTokenizer as ClipTokenizer
 
 logger = logging.getLogger("fiq_compose_fusion")
 
-DEFAULT_CKPT = str(ROOT / "output/fiq_retrieval/pytorch_model.bin.best.5")
+DEFAULT_CKPT = str(ROOT / "weights/fgsa/fashioniq/pytorch_model.bin")
 DEFAULT_DUAL = str(ROOT / "data/fashioniq/vision_desc/val_dual_targets.json")
 DEFAULT_OUT = str(ROOT / "output/fiq_vision_desc/compose_fusion_v1")
 DEFAULT_SCORE_CACHE = str(ROOT / "output/fiq_vision_desc/refsim_fusion_v1")

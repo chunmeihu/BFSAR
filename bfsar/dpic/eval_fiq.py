@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
-"""FIQ Original-Split coarse: A3 entity-only Banzhaf retriever + dual-path SDR.
+"""FashionIQ coarse retrieval: entity-only FGSA and dual-path scores.
 
-Replaces 3-level BFSAR FGSA (A4–A7) with A3's Banzhaf-guided entity-only matching
-(`fgsa_levels=1`), then the same RASD / DASD / dual fuse as mainline:
-
-  RASD: S_d=MIC, S_m=relative, S_r=ref↔gallery cosine
-  DASD: S_d=MIC, S_m=relative, S_r=vision_side FGSA
-  Dual:     w·z(RASD) + (1-w)·z(DASD)
-
-α/β/w are the mainline FIQ SOTA values (do not retune). Writes only under
-output/ablations/.
+Both paths use (alpha, beta) = (0.4, 0.2). The path mix weight is 0.5.
 """
 
 from __future__ import annotations
@@ -54,7 +46,6 @@ FIQ_ALPHA, FIQ_BETA, FIQ_WREF = 0.4, 0.2, 0.5
 OPENCLIP_CKPT = ROOT / "weights/openclip/ViT-L-14-laion2B-s32B-b82K.pt"
 DEFAULT_CKPT = ROOT / "weights/fgsa/fashioniq/pytorch_model.bin"
 DEFAULT_OUT = ROOT / "output/dpic/fashioniq"
-DEFAULT_DUAL = ROOT / "data/fashioniq/vision_desc/val_dual_targets.json"
 
 
 def _find_best_ckpt(ckpt_dir: Path) -> Path:
@@ -126,7 +117,7 @@ def encode_category(model, args, tokenizer, category: str, device, out: Path) ->
         category=category,
         max_words=args.max_words,
         skip_empty=True,
-        split="val",
+        split=args.split,
     )
     loader = DataLoader(
         dataset,
@@ -136,7 +127,7 @@ def encode_category(model, args, tokenizer, category: str, device, out: Path) ->
         pin_memory=True,
         collate_fn=collate_fn,
     )
-    gallery_loader, n_g, _ = build_fiq_gallery_dataloader(args, split="val", category=category)
+    gallery_loader, n_g, _ = build_fiq_gallery_dataloader(args, split=args.split, category=category)
     print(
         f"encode {category}: gallery={n_g} queries={len(dataset)} "
         f"fgsa_levels={args.fgsa_levels}",
@@ -192,10 +183,12 @@ def fuse_all(packs: Dict[str, Dict]) -> Dict:
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="A3 entity-only Banzhaf + dual-path FIQ coarse")
+    p = argparse.ArgumentParser(description="FashionIQ dual-path coarse retrieval")
+    p.add_argument("--split", choices=["val", "test"], default="val",
+                   help="val prints recall. test has no local target labels.")
     p.add_argument("--ckpt", default=str(DEFAULT_CKPT))
-    p.add_argument("--out_dir", default=str(DEFAULT_OUT))
-    p.add_argument("--dual_json", default=str(DEFAULT_DUAL))
+    p.add_argument("--out_dir", default=None)
+    p.add_argument("--dual_json", default=None)
     p.add_argument("--fgsa_levels", type=int, default=1, choices=[1, 3])
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--batch_size_val", type=int, default=8)
@@ -214,6 +207,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if not args.dual_json:
+        args.dual_json = fiq_paths.vision_dual_json(args.split)
+    if not args.out_dir:
+        args.out_dir = str(DEFAULT_OUT / args.split)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     ckpt = _find_best_ckpt(Path(args.ckpt))
@@ -261,6 +258,7 @@ def main():
         local_rank=0,
         image_resolution=224,
         gradient_checkpointing=1,
+        split=args.split,
         dual_json=args.dual_json,
         recompute=args.recompute,
     )
@@ -278,8 +276,18 @@ def main():
     for cat in CATS:
         npz_paths.append(encode_category(model, ns, tokenizer, cat, device, out))
 
-    if args.encode_only:
-        print("encode_only: skip fusion", flush=True)
+    if args.encode_only or args.split != "val":
+        if args.split != "val":
+            note = {
+                "split": args.split,
+                "dataset": "fashioniq",
+                "recall": None,
+                "note": "This split has no local target labels. Scores are the scores_*.npz files.",
+            }
+            (out / "metrics.json").write_text(json.dumps(note, indent=2) + "\n")
+            print(f"split={args.split}: no local labels, wrote scores under {out}", flush=True)
+        else:
+            print("encode_only: skip fusion", flush=True)
         return
 
     packs = {cat: _pack_from_npz(out / f"scores_{cat}.npz") for cat in CATS}
@@ -289,6 +297,7 @@ def main():
         "id": args.exp_id,
         "name": args.exp_name,
         "dataset": "fiq",
+        "split": args.split,
         "gallery": "original_split_large",
         "ckpt": str(ckpt),
         "fgsa_levels": args.fgsa_levels,

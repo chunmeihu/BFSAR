@@ -56,7 +56,9 @@ def run_cirr_blip2_qtr_rerank(
         stage = "b" if score_mode == "itm" else "a"
         if ckpt_path is not None and Path(ckpt_path).is_file():
             meta = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-            pretrained_id = str(meta.get("pretrained_id", pretrained_id))
+            from bfsar.rerank.paths import blip2_pretrained_id
+
+            pretrained_id = blip2_pretrained_id(str(meta.get("pretrained_id", pretrained_id)))
             stage = str(meta.get("stage", stage))
         model = build_blip2_qtr(
             device,

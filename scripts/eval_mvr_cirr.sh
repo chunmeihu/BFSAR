@@ -10,6 +10,9 @@ exec "${PY}" -m bfsar.mvr.fuse_cirr \
   --lambda_1 0.25 \
   --lambda_2 0.40 \
   --lambda_3 0.35 \
+  --split test \
+  --coarse_npz "${COARSE:-${ROOT}/output/dpic/cirr/test/coarse_sim.npz}" \
+  --topk_pt "${TOPK:-${ROOT}/output/mvr/cirr/top200_test.pt}" \
   --cqm_ckpt "${CQM:-${ROOT}/weights/cqm/cirr/cqm.pt}" \
   --stage1_path "${CVS1:-${ROOT}/weights/cvs/cirr/stage1.pt}" \
   --stage2_path "${CVS2:-${ROOT}/weights/cvs/cirr/stage2.pt}" \

@@ -15,24 +15,22 @@ from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normal
 
 import random
 
-# GBCIR layout:
+# Dataset layout:
 #   data/fashioniq/{captions,image_splits,images}
 #   data/cirr/cirr_dataset/...
-# CR package root (BFSAR/rerank/cr): checkpoints training dumps + optional legacy symlinks.
 _CR_PKG = Path(__file__).resolve().parents[1]
 _REPO = Path(__file__).resolve().parents[4]
 _FIQ_DATA = Path(os.environ.get("FIQ_DATA_ROOT", _REPO / "data" / "fashioniq"))
 _CIRR_DATA = Path(os.environ.get("CIRR_DATA_ROOT", _REPO / "data" / "cirr"))
-_CR_OUTPUT = Path(os.environ.get("GBCIR_CR_OUTPUT", _REPO / "output" / "cr_train"))
+_CR_OUTPUT = Path(os.environ.get("BFSAR_CVS_OUTPUT", _REPO / "output" / "cr_train"))
 
-# Upstream CR used Candidate-Reranking-CIR as base_path (parent of src).
-# Keep overridable for CIRR inference (hbi_blip_rerank sets this to data/cirr).
+# Candidate-Reranking used its own package root as base_path. Override with BFSAR_CVS_ROOT.
 base_path = Path(os.environ.get("BFSAR_CVS_ROOT", _CR_OUTPUT))
 _CR_OUTPUT.mkdir(parents=True, exist_ok=True)
 
 
 def _fiq_dataset_root() -> Path:
-    """Prefer GBCIR data/fashioniq; fall back to base_path/fashionIQ_dataset."""
+    """Prefer data/fashioniq; fall back to base_path/fashionIQ_dataset."""
     if (_FIQ_DATA / "captions").is_dir():
         return _FIQ_DATA
     legacy = base_path / "fashionIQ_dataset"
