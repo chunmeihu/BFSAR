@@ -27,12 +27,10 @@ ARCH_TAG = "qtr_v1c"  # v1c: freeze emb + CIRR group hard-negs on native ITM
 
 def _get_cr_tokenizer():
     import os
-    import sys
 
-    from bfsar.mvr.cvs_infer import CR_SRC, REPO_ROOT
+    from bfsar.mvr.cvs_infer import CR_SRC, REPO_ROOT, _import_blip_modules
 
-    if str(CR_SRC) not in sys.path:
-        sys.path.insert(0, str(CR_SRC))
+    _import_blip_modules()
     os.chdir(CR_SRC)
     try:
         from blip import init_tokenizer  # noqa: WPS433

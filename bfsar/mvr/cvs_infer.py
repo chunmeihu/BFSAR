@@ -21,6 +21,7 @@ from bfsar.rerank.paths import (
     CR_SRC,
     DEFAULT_CIRR_STAGE1,
     DEFAULT_CIRR_STAGE2,
+    ensure_candidate_rerank_checkout,
 )
 
 logger = logging.getLogger("bfsar_cvs")
@@ -71,14 +72,38 @@ def _prefer_offline_hf_bert() -> None:
     logger.info("bert-base-uncased: using local HF cache (offline, no HF_ENDPOINT/proxy)")
 
 
+def _use_local_bert_tokenizer(blip_mod, med_mod=None) -> None:
+    """Point their tokenizer at weights/bert when that copy is present."""
+    local = REPO_ROOT / "weights" / "bert" / "bert-base-uncased"
+    if not (local / "vocab.txt").is_file():
+        return
+    from transformers import BertTokenizer
+
+    def init_tokenizer():
+        tokenizer = BertTokenizer.from_pretrained(str(local))
+        tokenizer.add_special_tokens({"bos_token": "[DEC]"})
+        tokenizer.add_special_tokens({"additional_special_tokens": ["[ENC]"]})
+        tokenizer.enc_token_id = tokenizer.additional_special_tokens_ids[0]
+        return tokenizer
+
+    blip_mod.init_tokenizer = init_tokenizer
+    if med_mod is not None:
+        med_mod.init_tokenizer = init_tokenizer
+
+
 def _import_blip_modules():
     _prefer_offline_hf_bert()
     _ensure_cirr_image_symlinks()
+    ensure_candidate_rerank_checkout()
     if str(CR_SRC) not in sys.path:
         sys.path.insert(0, str(CR_SRC))
     prev = os.getcwd()
     os.chdir(CR_SRC)
     try:
+        import blip  # noqa: WPS433
+        import med  # noqa: WPS433
+
+        _use_local_bert_tokenizer(blip, med)
         import data_utils  # noqa: WPS433
 
         data_utils.base_path = Path(cirr_paths.CIRR_DATASET_ROOT).parent
@@ -492,7 +517,7 @@ def metrics_stage2_pool(
     """Metrics within stage-1 top-K pool (Candidate-Reranking stage2 convention).
 
     Group recall: after BLIP reranks the five non-reference group images, check
-    whether ``target_hard`` is in top-1/2/3 of those names (see validate_stage2.py).
+    whether ``target_hard`` is in top-1/2/3 of those names.
     """
     labels = np.take_along_axis(labels_topk, rerank_idx, axis=1)
     tgts = np.asarray(target_names).reshape(-1, 1)

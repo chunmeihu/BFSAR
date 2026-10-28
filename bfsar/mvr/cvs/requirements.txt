@@ -1,7 +1,0 @@
-torch
-torchvision
-torchaudio
-pandas
-timm==0.4.12
-transformers==4.25.0
-fairscale==0.4.4

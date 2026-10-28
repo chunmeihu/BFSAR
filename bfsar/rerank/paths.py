@@ -7,16 +7,30 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-CVS_ROOT = Path(os.environ.get("BFSAR_CVS_ROOT", REPO_ROOT / "bfsar" / "mvr" / "cvs"))
+# Official Candidate-Reranking-CIR checkout. Readers clone it themselves.
+CVS_ROOT = Path(os.environ.get("BFSAR_CVS_ROOT", REPO_ROOT / "third_party" / "Candidate-Reranking-CIR"))
 CVS_SRC = CVS_ROOT / "src"
 CVS_CONFIGS = CVS_ROOT / "configs"
 CVS_WEIGHTS = Path(os.environ.get("BFSAR_CVS_WEIGHTS", REPO_ROOT / "weights" / "cvs"))
 
-# Names still used by the vendored verification trainer.
 CR_ROOT = CVS_ROOT
 CR_SRC = CVS_SRC
 CR_CONFIGS = CVS_CONFIGS
 CR_WEIGHTS = CVS_WEIGHTS
+
+
+def ensure_candidate_rerank_checkout() -> Path:
+    """Inference imports the official checkout; this repository does not ship that code."""
+    marker = CVS_SRC / "blip_stage1.py"
+    if marker.is_file():
+        return CVS_ROOT
+    raise FileNotFoundError(
+        "Candidate verification uses the official Candidate-Reranking-CIR code, "
+        "which is not included in this repository.\n"
+        "Clone https://github.com/Cuberick-Orion/Candidate-Reranking-CIR into\n"
+        f"  {REPO_ROOT / 'third_party' / 'Candidate-Reranking-CIR'}\n"
+        "or set BFSAR_CVS_ROOT to that checkout. Its license is in that repository."
+    )
 
 DEFAULT_CIRR_STAGE1 = CVS_WEIGHTS / "cirr" / "stage1.pt"
 DEFAULT_CIRR_STAGE2 = CVS_WEIGHTS / "cirr" / "stage2.pt"
